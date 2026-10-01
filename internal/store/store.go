@@ -160,6 +160,28 @@ CREATE TABLE IF NOT EXISTS release_change_entries (
 	if err := s.migrateReleaseBatchIndexes(); err != nil {
 		return err
 	}
+	const promotionRouteSchema = `
+CREATE TABLE IF NOT EXISTS promotion_routes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  name       TEXT    NOT NULL UNIQUE,
+  created_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE TABLE IF NOT EXISTS promotion_route_environments (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  route_id    INTEGER NOT NULL REFERENCES promotion_routes(id),
+  position    INTEGER NOT NULL,
+  environment TEXT    NOT NULL
+);
+CREATE TABLE IF NOT EXISTS release_batch_promotion_routes (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id   TEXT    NOT NULL UNIQUE,
+  route_name TEXT    NOT NULL,
+  bound_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+`
+	if _, err := s.db.Exec(promotionRouteSchema); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
 	return nil
 }
 

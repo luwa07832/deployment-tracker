@@ -28,4 +28,8 @@ func Register(engine *gin.Engine, deps Dependencies) {
 	group.GET("/release-batches/:batch_id/promotion-chain", getPromotionChain(deps))
 	group.GET("/release-batches/:batch_id/promotion-diff", getPromotionDiff(deps))
 	group.GET("/release-batches/:batch_id/changes/:title/trace", tracePromotionChange(deps))
+	group.POST("/promotion-routes", createPromotionRoute(deps))
+	group.GET("/promotion-routes", listPromotionRoutes(deps))
+	group.GET("/promotion-routes/:name", getPromotionRoute(deps))
+	group.PUT("/release-batches/:batch_id/promotion-route", bindPromotionRoute(deps))
 }

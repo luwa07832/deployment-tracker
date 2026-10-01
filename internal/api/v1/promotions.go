@@ -200,7 +200,7 @@ func validatePromotionRequest(c *gin.Context, deps Dependencies) (promotionReque
 		BatchID:      strings.TrimSpace(c.Param("batch_id")),
 		Environments: nil,
 	}
-	environments, ok := parseEnvironmentSequence(c, deps, c.Query("environments"))
+	environments, ok := resolvePromotionSequence(c, deps, req.BatchID)
 	if !ok {
 		return req, false
 	}

@@ -24,6 +24,14 @@ const (
 	CodeSamePromotionNodeV1        = "SAME_PROMOTION_NODE"
 	CodePromotionChangeNotFoundV1  = "PROMOTION_CHANGE_NOT_FOUND"
 
+	// Named promotion routes and per-batch route bindings.
+	CodePromotionRouteNotFoundV1          = "PROMOTION_ROUTE_NOT_FOUND"
+	CodePromotionRouteConflictV1          = "PROMOTION_ROUTE_CONFLICT"
+	CodePromotionRouteValidationV1        = "PROMOTION_ROUTE_VALIDATION_FAILED"
+	CodePromotionRouteAlreadyBoundV1      = "PROMOTION_ROUTE_ALREADY_BOUND"
+	CodePromotionRouteBindingValidationV1 = "PROMOTION_ROUTE_BINDING_VALIDATION_FAILED"
+	CodePromotionSelectorConflictV1       = "PROMOTION_SELECTOR_CONFLICT"
+
 	// Cross-environment release comparison with explicitly selected versions
 	// and per-environment release history.
 	CodeReleaseComparisonEnvironmentNotFound = "ReleaseComparisonEnvironmentNotFound"

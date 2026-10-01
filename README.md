@@ -444,3 +444,44 @@ go run .
 | 追溯的变更条目不属于该批次 | 404 | `PROMOTION_CHANGE_NOT_FOUND` |
 
 单元素环境序列是合法的：链路返回一个节点、空 `segment_diffs` 与 `consistent: true`。序列校验先于批次存在性检查，因此未知批次配重复/未知环境时仍返回 400；批次存在性先于节点顺序检查。
+
+## 晋级路线与批次绑定 API（/api/v1）
+
+晋级路线把一条有序环境序列登记为可复用的命名事实；发布批次可以绑定一条路线，链路查询与变更追溯在未显式给出环境序列时改用绑定路线。路线与绑定都不改写发布事实、不合并批次、不登记环境。
+
+### `POST /api/v1/promotion-routes`
+
+登记一条晋级路线。请求体：
+
+```json
+{"name": "prod-line", "environments": ["dev", "test", "staging", "prod"]}
+```
+
+- `name` 修剪空白后必填、最长 128 个字符、全库唯一；匹配精确、不模糊、不做大小写折叠。
+- `environments` 为有序、非空、不重复的已登记环境键序列；顺序即晋级方向。
+- 新建成功返回 HTTP 201 `{"promotion_route": {"name": "...", "environments": [...]}}`；同名同序列重复提交返回 HTTP 200 与已有路线（幂等），同名异序列返回 HTTP 409 `PROMOTION_ROUTE_CONFLICT`。
+- 序列含未登记环境返回 HTTP 404 `ENVIRONMENT_NOT_FOUND`；字段缺失、类型不符、含空段或重复环境返回 HTTP 422 `PROMOTION_ROUTE_VALIDATION_FAILED`；请求体非法 JSON 返回 HTTP 400 `invalid_request`。
+
+### `GET /api/v1/promotion-routes`
+
+返回 HTTP 200 `{"promotion_routes": [...]}`，按 `name` 字典序排列；无路线时为确定的空数组。
+
+### `GET /api/v1/promotion-routes/{name}`
+
+返回单条路线 HTTP 200 `{"promotion_route": {...}}`；`name` 未知或修剪后为空返回 HTTP 404 `PROMOTION_ROUTE_NOT_FOUND`。
+
+### `PUT /api/v1/release-batches/{batch_id}/promotion-route`
+
+把批次绑定到一条路线。请求体 `{"route": "prod-line"}`：
+
+- 首次绑定返回 HTTP 201 `{"batch_id": "...", "route": "..."}`；重复绑定同一路线返回 HTTP 200（幂等）；已绑定其他路线时改绑返回 HTTP 409 `PROMOTION_ROUTE_ALREADY_BOUND`，绑定保持不变。
+- 路线不存在返回 HTTP 404 `PROMOTION_ROUTE_NOT_FOUND`；批次不存在返回 HTTP 404 `RELEASE_BATCH_NOT_FOUND`；字段缺失、空白或类型不符返回 HTTP 422 `PROMOTION_ROUTE_BINDING_VALIDATION_FAILED`；非法 JSON 返回 HTTP 400 `invalid_request`。
+
+### 链路查询与追溯的路线选择器
+
+`GET /api/v1/release-batches/{batch_id}/promotion-chain` 与 `GET /api/v1/release-batches/{batch_id}/changes/{title}/trace` 新增可选查询参数 `route`：
+
+- `route=<name>` 时按该路线的环境序列计算 `nodes`、`segment_diffs`、`consistent` 以及追溯的首次进入、连续通过与首个缺失环境，语义与显式 `environments` 完全一致。
+- 既不传 `route` 也不传 `environments` 时，使用批次绑定的路线；批次未绑定则返回 HTTP 400 `INVALID_PROMOTION_SEQUENCE`。
+- `route` 与 `environments` 同时出现返回 HTTP 400 `PROMOTION_SELECTOR_CONFLICT`；`route` 未知返回 HTTP 404 `PROMOTION_ROUTE_NOT_FOUND`。
+- 选择器冲突、序列校验与路线/绑定读取都先于批次存在性检查；`environments` 显式序列与 `promotion-diff` 的行为不变。
