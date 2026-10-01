@@ -344,9 +344,31 @@ go run .
 - 成功响应中的记录在带批次时额外包含 `"batch_id": "..."`；`GET /api/v1/release-records` 新增可选过滤参数 `batch_id`（精确匹配，与其它过滤条件 AND 组合）。
 - 批次隔离是硬边界：链路、差异与追溯只读取同一 `batch_id` 的发布事实，多个批次复用同一版本也不会被合并成别的链路。
 
+### 晋级路线（promotion routes）
+
+晋级路线是一条具名、有序的已登记环境序列，批次可以绑定一条路线，之后链路与追溯查询无需再显式给环境序列。路线不写发布事实、不登记环境、不合并批次。
+
+- `POST /api/v1/promotion-routes`：请求体 `{"name":"prod-line","environments":["dev","test","prod"]}`。
+  - `name` 修剪后必须非空且不超过 128 个字符；环境名保持原值精确匹配，不做模糊匹配或大小写折叠。
+  - `environments` 为非空有序数组，各项修剪后不能为空、不能重复，且每一个都必须是已登记环境键。
+  - 首次创建返回 201 与 `{"promotion_route":{"name":"...","environments":[...]}}`；同名同序列重复提交幂等返回 200；同名但环境序列不同返回 409 `PROMOTION_ROUTE_CONFLICT`。
+  - 字段缺失/类型错误、`name` 空白或超长、环境序列为空/含空段/含重复环境返回 422 `PROMOTION_ROUTE_VALIDATION_FAILED`；序列中存在未登记环境返回 404 `ENVIRONMENT_NOT_FOUND`；请求体不是合法 JSON 返回 400 `invalid_request`。
+- `GET /api/v1/promotion-routes`：返回 `{"promotion_routes":[...]}`，按 `name` 字典序排列，每项含 `name` 与有序 `environments`。
+- `GET /api/v1/promotion-routes/{name}`：返回单个 `{"promotion_route":{...}}`；名称按修剪后的键精确识别；未知或空白 `name` 返回 404 `PROMOTION_ROUTE_NOT_FOUND`。
+- `PUT /api/v1/release-batches/{batch_id}/promotion-route`：请求体 `{"route":"prod-line"}`，把批次绑定到一条已存在的路线。
+  - 首次绑定返回 201 与 `{"batch_id":"...","route":"..."}`；重复绑定同一路线幂等返回 200；批次已绑定其它路线时改绑返回 409 `PROMOTION_ROUTE_ALREADY_BOUND`。
+  - 路线不存在返回 404 `PROMOTION_ROUTE_NOT_FOUND`；批次不存在返回 404 `RELEASE_BATCH_NOT_FOUND`（路线读取先于批次检查）；`route` 缺失、空白或类型错误返回 422 `PROMOTION_ROUTE_BINDING_VALIDATION_FAILED`；非法 JSON 一律 400 `invalid_request`。
+
 ### `GET /api/v1/release-batches/{batch_id}/promotion-chain`
 
-查询参数 `environments` 为逗号分隔的**有序**环境序列，例如 `dev,test,staging,prod`。返回该批次按晋级顺序排列的完整链路：
+环境序列通过选择器确定：
+
+- `environments=dev,test,staging,prod`：逗号分隔的**有序**显式环境序列（原有行为，保持不变）；
+- `route=prod-line`：按已登记晋级路线的环境序列计算 `nodes`、`segment_diffs` 与 `consistent`；
+- 两者都不传：使用该批次绑定的路线；批次未绑定任何路线时返回 400 `INVALID_PROMOTION_SEQUENCE`；
+- `environments` 与 `route` 同时出现返回 400 `PROMOTION_SELECTOR_CONFLICT`；`route` 指向未知路线返回 404 `PROMOTION_ROUTE_NOT_FOUND`。
+
+选择器解析与路线读取都先于批次存在性检查；路线名精确匹配、不模糊、不改大小写。返回该批次按晋级顺序排列的完整链路：
 
 ```json
 {
@@ -411,6 +433,8 @@ go run .
 
 ### `GET /api/v1/release-batches/{batch_id}/changes/{title}/trace?environments=dev,test,staging,prod`
 
+环境序列的选择方式与 `promotion-chain` 完全一致：`environments` 显式序列、`route` 路线选择器、或在两者缺失时回退到批次绑定的路线；选择器与读取校验顺序也相同。
+
 按变更条目稳定标识 `title` 追溯它在链路中的走向：
 
 ```json
@@ -436,6 +460,9 @@ go run .
 | 场景 | 状态码 | code |
 |---|---|---|
 | 批次在所有发布记录中都不存在（唯一可观察的批次 NotFound） | 404 | `RELEASE_BATCH_NOT_FOUND` |
+| `route` 指向未知（或空白）路线；选择器/绑定读取先于批次检查 | 404 | `PROMOTION_ROUTE_NOT_FOUND` |
+| `environments` 与 `route` 同时提供 | 400 | `PROMOTION_SELECTOR_CONFLICT` |
+| 未绑定批次又同时缺少 `environments` 与 `route` | 400 | `INVALID_PROMOTION_SEQUENCE` |
 | `environments` 缺失、为空、含空段或含重复环境（消息中指出冲突环境） | 400 | `INVALID_PROMOTION_SEQUENCE` |
 | 序列包含未登记环境（消息中指出未知环境） | 400 | `INVALID_PROMOTION_SEQUENCE` |
 | 请求节点在该批次内没有发布事实，无法确定先后顺序（消息中指出缺顺序信息的节点） | 409 | `PROMOTION_ORDER_CONFLICT` |
@@ -443,4 +470,4 @@ go run .
 | 局部差异 `from` 与 `to` 相同 | 400 | `SAME_PROMOTION_NODE` |
 | 追溯的变更条目不属于该批次 | 404 | `PROMOTION_CHANGE_NOT_FOUND` |
 
-单元素环境序列是合法的：链路返回一个节点、空 `segment_diffs` 与 `consistent: true`。序列校验先于批次存在性检查，因此未知批次配重复/未知环境时仍返回 400；批次存在性先于节点顺序检查。
+单元素环境序列是合法的：链路返回一个节点、空 `segment_diffs` 与 `consistent: true`。序列校验先于批次存在性检查，因此未知批次配重复/未知环境时仍返回 400；选择器冲突、未知路线以及未绑定缺序列都在批次检查之前返回；批次存在性先于节点顺序检查。`promotion-diff` 继续只接受显式的 `from`/`to`，不读取路线或绑定，其行为与响应保持不变；环境差异查询（`environments` 与 `compare` 等入口）同样不受路线影响。查询不改写发布事实、不登记环境、不合并批次。

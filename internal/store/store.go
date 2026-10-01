@@ -139,6 +139,22 @@ CREATE TABLE IF NOT EXISTS release_change_entries (
   title       TEXT    NOT NULL,
   description TEXT    NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS promotion_routes (
+  id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT    NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS promotion_route_environments (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  route_id    INTEGER NOT NULL REFERENCES promotion_routes(id),
+  position    INTEGER NOT NULL,
+  environment TEXT    NOT NULL,
+  UNIQUE (route_id, position),
+  UNIQUE (route_id, environment)
+);
+CREATE TABLE IF NOT EXISTS release_batch_routes (
+  batch_id TEXT    PRIMARY KEY,
+  route_id INTEGER NOT NULL REFERENCES promotion_routes(id)
+);
 `
 	if _, err := s.db.Exec(trackedSchema); err != nil {
 		return fmt.Errorf("store: migrate: %w", err)

@@ -200,11 +200,62 @@ func validatePromotionRequest(c *gin.Context, deps Dependencies) (promotionReque
 		BatchID:      strings.TrimSpace(c.Param("batch_id")),
 		Environments: nil,
 	}
-	environments, ok := parseEnvironmentSequence(c, deps, c.Query("environments"))
-	if !ok {
+	_, hasEnvironments := c.GetQuery("environments")
+	rawRoute, hasRoute := c.GetQuery("route")
+	if hasEnvironments && hasRoute {
+		fail(c, http.StatusBadRequest, store.CodePromotionSelectorConflictV1,
+			"environments and route selectors must not be provided together")
 		return req, false
 	}
-	req.Environments = environments
+	switch {
+	case hasEnvironments:
+		environments, ok := parseEnvironmentSequence(c, deps, c.Query("environments"))
+		if !ok {
+			return req, false
+		}
+		req.Environments = environments
+	case hasRoute:
+		name := strings.TrimSpace(rawRoute)
+		if name == "" {
+			fail(c, http.StatusNotFound, store.CodePromotionRouteNotFoundV1, "no such promotion route")
+			return req, false
+		}
+		route, err := deps.Store.GetPromotionRoute(name)
+		if err != nil {
+			failStorage(c)
+			return req, false
+		}
+		if route == nil {
+			fail(c, http.StatusNotFound, store.CodePromotionRouteNotFoundV1, "no such promotion route "+name)
+			return req, false
+		}
+		req.Environments = append(req.Environments, route.Environments...)
+	default:
+		// No explicit selector: the batch's bound route determines the
+		// sequence. The binding (or lack of it) is observable before the
+		// batch existence check.
+		routeName, err := deps.Store.GetBoundRouteName(req.BatchID)
+		if err != nil {
+			failStorage(c)
+			return req, false
+		}
+		if routeName == "" {
+			fail(c, http.StatusBadRequest, store.CodePromotionSequenceInvalidV1,
+				"environments or route selector is required when the batch is not bound to a promotion route")
+			return req, false
+		}
+		route, err := deps.Store.GetPromotionRoute(routeName)
+		if err != nil {
+			failStorage(c)
+			return req, false
+		}
+		if route == nil {
+			fail(c, http.StatusNotFound, store.CodePromotionRouteNotFoundV1,
+				"no such promotion route "+routeName)
+			return req, false
+		}
+		req.Environments = append(req.Environments, route.Environments...)
+	}
 	if !requireBatch(c, deps, req.BatchID) {
 		return req, false
 	}
