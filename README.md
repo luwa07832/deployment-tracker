@@ -119,9 +119,93 @@ go run .
 - 没有共同版本时 `common_versions` 与 `version_diffs` 为确定的空数组。
 - `left` 与 `right` 相同返回 HTTP 409 `comparison_conflict`；任一环境不存在返回 HTTP 404 `environment_not_found`；缺少 `left` 或 `right` 返回 HTTP 400 `invalid_request`。
 
+### `GET /release-comparisons?left=<env>&left_version=<v>&right=<env>&right_version=<v>`
+
+跨环境发布差异比对：为两侧各指定一个目标环境和该环境上的一个版本（四个参数全部必填），系统按统一口径直接返回逐条差异。环境名与版本标识按既有发布记录的**原值精确识别**，不做大小写、空白或模糊匹配改写。两侧可以是同一个环境（用于同一环境内两个历史版本的比较）。
+
+返回 HTTP 200：
+
+```json
+{
+  "left_environment": "staging",
+  "left_version": "1.0.0",
+  "right_environment": "prod",
+  "right_version": "1.0.0",
+  "left_release":  { "id": 7, "environment": "staging", "version": "1.0.0", "changes": ["login", "beta"], "gate_status": "allowed", "rollback_point": "0.8.0", "registered_at": "..." },
+  "right_release": { "id": 8, "environment": "prod",    "version": "1.0.0", "changes": ["login", "gamma"], "gate_status": "blocked", "rollback_point": "0.8.0", "registered_at": "..." },
+  "version":       { "left": "1.0.0", "right": "1.0.0", "consistent": true },
+  "gate_status":   { "left": "allowed", "right": "blocked", "consistent": false },
+  "rollback_point": {
+    "left":  { "identifier": "0.8.0", "target_release": { "...": "左侧回滚点指向的发布记录" } },
+    "right": { "identifier": "0.8.0", "target_release": { "...": "右侧回滚点指向的发布记录" } },
+    "consistent": true
+  },
+  "change_diffs": [
+    {
+      "change_id": "beta",
+      "summary": "beta",
+      "kind": "missing",
+      "present_on_left": true,
+      "present_on_right": false,
+      "content_status": "absent",
+      "left": "beta"
+    },
+    {
+      "change_id": "gamma",
+      "summary": "gamma",
+      "kind": "added",
+      "present_on_left": false,
+      "present_on_right": true,
+      "content_status": "absent",
+      "right": "gamma"
+    }
+  ],
+  "consistent": false
+}
+```
+
+约定：
+
+- 变更以其稳定标识（记录里的变更条目原值）识别，方向固定为 left → right：`kind` 为 `added`（右侧有、左侧无）、`missing`（左侧有、右侧无）或 `changed`（两侧都有但内容不同）。每条都给出 `change_id`、`summary`、`present_on_left`/`present_on_right` 两侧存在状态与 `content_status`（`same`/`different`/`absent`）。
+- 变更条目按 `change_id` 字典序稳定输出；内容完全相同时 `change_diffs` 为确定的空数组 `[]`，此时各标量结论也一致则顶层 `consistent` 为 `true`。
+- `version`、`gate_status`、`rollback_point` 各自给出两侧记录值与 `consistent` 结论。门禁状态按**发布时记录的原值**比较，不根据当前状态重新推断。
+- 回滚点同时比较标识与所指向的发布对象：回滚点标识是该环境上被指向的历史发布版本（与 `GET /environments/{environment}/history` 的回溯口径一致，即同环境下版本等于回滚点标识的发布）；两侧 `target_release` 完整回溯到原始发布记录。只有标识相同且目标发布的门禁状态、变更集合、目标自身回滚点标识也全部相同时 `rollback_point.consistent` 才为 `true`（比较不递归）。
+- 响应不含服务端生成时刻；相同输入连续查询时字段、条目顺序和结论逐字节一致。查询不写任何数据。
+
+错误码（错误体仍只有 `error` 一个顶层键）：
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| 缺少四个必填参数中的任何一个 | 400 | `invalid_request` |
+| 请求的环境在既有发布记录中不存在（按固定 left、right 顺序先校验环境，再校验版本） | 404 | `ReleaseComparisonEnvironmentNotFound` |
+| 指定版本在该环境的发布记录中不存在（精确值匹配，`1.2` 不会匹配 `1.2.0`） | 404 | `ReleaseComparisonVersionNotFound` |
+| 发布（或其回滚点指向的目标发布）缺少变更、门禁状态或回滚点等比较必需数据，或回滚点不指向任何已记录发布 | 422 | `ReleaseComparisonDataIncomplete` |
+
+### `GET /environments/{environment}/release-history[?limit=<n>&cursor=<token>]`
+
+按环境查询发布时间由近到远（`registered_at` 倒序，同一时刻按写入顺序倒序）的发布历史。每条完整保留版本、变更条目、门禁状态和回滚点，并带 `id`，可继续通过 `GET /releases/{environment}/{version}` 回溯到该次发布。
+
+返回 HTTP 200：
+
+```json
+{
+  "environment": "prod",
+  "limit": 20,
+  "next_cursor": "N...",
+  "releases": [ { "...": "与 POST /releases 相同的发布记录形状" } ]
+}
+```
+
+- `limit` 可选，默认 20，最大 100；非法（非正整数、超过上限或非数字）返回 HTTP 400 `invalid_request`。
+- 翻页使用上一页响应中的不透明 `cursor`（URL-safe，调用方只原样回传）；分页基于 `(发布时间, 登记 id)` 的 keyset 定位，翻页期间即使有更新的发布写入，也不会重复或遗漏任何已经记录的发布；没有下一页时 `next_cursor` 省略。
+- 环境不存在返回 HTTP 404 `environment_not_found`；游标无法解码返回 HTTP 400 `invalid_request`。
+- 该入口为只读查询，不改变 `GET /environments/{environment}/history`（从旧到新、无分页）的既有行为。
+
 ### 旧记录的读取约定
 
 本次新增字段（`changes`、`gate_status`、`rollback_point`）只对新登记和差异比较生效。早于这些字段写入的记录保持原值可读：输出中跳过这三个字段，不判为无效，也不补写。
+
+当上述新的比对/历史入口遇到这种缺少 `changes`、`gate_status` 或 `rollback_point` 的旧记录，或回滚点不指向任何已记录发布时，返回确定的 HTTP 422 `ReleaseComparisonDataIncomplete`，而不是把缺失折叠成空结果。
 
 ## 错误返回约定
 
@@ -133,7 +217,7 @@ go run .
 
 `code` 使用小写下划线形式，`message` 不包含堆栈、文件路径或 SQL。
 
-当前使用的 `code`：`invalid_request`、`not_found`、`conflict`、`storage_unavailable`、`invalid_release_input`、`release_not_found`、`environment_not_found`、`release_conflict`、`comparison_conflict`。
+当前使用的 `code`：`invalid_request`、`not_found`、`conflict`、`storage_unavailable`、`invalid_release_input`、`release_not_found`、`environment_not_found`、`release_conflict`、`comparison_conflict`、`ReleaseComparisonEnvironmentNotFound`、`ReleaseComparisonVersionNotFound`、`ReleaseComparisonDataIncomplete`。
 
 ## 可追溯发布记录 API（/api/v1）
 

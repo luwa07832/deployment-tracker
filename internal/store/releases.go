@@ -131,6 +131,65 @@ func (s *Store) EnvironmentExists(environment string) (bool, error) {
 	return count > 0, nil
 }
 
+// HistoryPage is one stable page of an environment's release history, newest
+// first. Records sharing a created_at timestamp break ties by registration
+// id, so paging forward never repeats or skips a row, even when new releases
+// are registered while a caller pages.
+type HistoryPage struct {
+	Releases   []Release
+	HasNext    bool
+	NextLastID int64
+	NextLastAt string
+}
+
+// ListReleaseHistory returns one keyset page for one environment, ordered by
+// created_at DESC and id DESC. The page carries up to limit releases; when
+// more rows follow, the page also carries the opaque continuation position
+// for the next request. An empty zero-id cursor starts at the newest release.
+func (s *Store) ListReleaseHistory(environment string, limit int, afterID int64, afterAt string) (HistoryPage, error) {
+	var (
+		releases []Release
+		args     []any
+	)
+	query := `SELECT ` + releaseColumns + ` FROM deployments WHERE environment = ?`
+	args = append(args, environment)
+	if afterID > 0 {
+		// The cursor points at the last row already returned; keep only rows
+		// strictly earlier in the (created_at, id) ordering.
+		query += ` AND (created_at < ? OR (created_at = ? AND id < ?))`
+		args = append(args, afterAt, afterAt, afterID)
+	}
+	query += ` ORDER BY created_at DESC, id DESC LIMIT ?`
+	args = append(args, limit+1)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return HistoryPage{}, fmt.Errorf("store: list release history: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		rel, err := scanRelease(rows)
+		if err != nil {
+			return HistoryPage{}, fmt.Errorf("store: list release history: %w", err)
+		}
+		releases = append(releases, *rel)
+	}
+	if err := rows.Err(); err != nil {
+		return HistoryPage{}, fmt.Errorf("store: list release history: %w", err)
+	}
+	page := HistoryPage{Releases: []Release{}}
+	if len(releases) > limit {
+		page.HasNext = true
+		releases = releases[:limit]
+	}
+	page.Releases = releases
+	if page.HasNext {
+		last := releases[len(releases)-1]
+		page.NextLastID = last.ID
+		page.NextLastAt = last.CreatedAt
+	}
+	return page, nil
+}
+
 // scanRelease reads one row from anything that behaves like sql.Row or sql.Rows.
 func scanRelease(row interface{ Scan(...any) error }) (*Release, error) {
 	var rel Release

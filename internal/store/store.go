@@ -20,6 +20,11 @@ const (
 	CodeEnvironmentNotFound = "environment_not_found"
 	CodeReleaseConflict     = "release_conflict"
 	CodeComparisonConflict  = "comparison_conflict"
+
+	// Version-pinned cross-environment comparison and paged release history.
+	CodeReleaseComparisonEnvironmentNotFound = "ReleaseComparisonEnvironmentNotFound"
+	CodeReleaseComparisonVersionNotFound     = "ReleaseComparisonVersionNotFound"
+	CodeReleaseComparisonDataIncomplete      = "ReleaseComparisonDataIncomplete"
 )
 
 // Error is the JSON shape of a failed request as described in README.md.

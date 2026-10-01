@@ -198,3 +198,85 @@ func TestLegacyDatabaseStaysReadable(t *testing.T) {
 		t.Fatalf("legacy history = %+v, want both rows in registration order", history)
 	}
 }
+
+func TestListReleaseHistoryKeysetPaging(t *testing.T) {
+	db := openTestStore(t)
+	// Five rows; the middle three share one timestamp so registration id is
+	// the tie breaker and must keep paging stable.
+	ordered := []struct {
+		version  string
+		insertAt string
+	}{
+		{"1.0.0", "2026-10-01T08:00:00Z"},
+		{"1.0.1", "2026-10-01T09:00:00Z"},
+		{"1.0.2", "2026-10-01T09:00:00Z"},
+		{"1.0.3", "2026-10-01T09:00:00Z"},
+		{"1.0.4", "2026-10-01T10:00:00Z"},
+	}
+	for _, item := range ordered {
+		gate, rollback := "allowed", "0.9.0"
+		rel := Release{
+			Environment: "prod", Version: item.version, Changes: []string{"c"},
+			GateStatus: &gate, RollbackPoint: &rollback,
+		}
+		if err := db.InsertRelease(&rel); err != nil {
+			t.Fatalf("insert %s: %v", item.version, err)
+		}
+		if _, err := db.db.Exec(
+			`UPDATE deployments SET created_at = ? WHERE id = ?`, item.insertAt, rel.ID,
+		); err != nil {
+			t.Fatalf("pin created_at for %s: %v", item.version, err)
+		}
+	}
+	var (
+		afterID   int64
+		afterAt   string
+		collected []string
+		pages     int
+	)
+	for {
+		page, err := db.ListReleaseHistory("prod", 2, afterID, afterAt)
+		if err != nil {
+			t.Fatalf("list history page: %v", err)
+		}
+		for i := range page.Releases {
+			collected = append(collected, page.Releases[i].Version)
+		}
+		pages++
+		if !page.HasNext {
+			break
+		}
+		afterID, afterAt = page.NextLastID, page.NextLastAt
+	}
+	want := []string{"1.0.4", "1.0.3", "1.0.2", "1.0.1", "1.0.0"}
+	if len(collected) != len(want) {
+		t.Fatalf("collected %v, want %v", collected, want)
+	}
+	for i := range want {
+		if collected[i] != want[i] {
+			t.Fatalf("collected %v, want %v (newest first, id tie-break)", collected, want)
+		}
+	}
+	if pages != 3 {
+		t.Fatalf("pages = %d, want 3 (2+2+1)", pages)
+	}
+}
+
+func TestListReleaseHistoryScopesByEnvironment(t *testing.T) {
+	db := openTestStore(t)
+	for _, item := range []struct{ env, version string }{
+		{"prod", "1.0.0"}, {"stage", "1.0.0"}, {"prod", "1.0.1"},
+	} {
+		rel := sampleRelease(item.env, item.version, "allowed", "0.9.0", "c")
+		if err := db.InsertRelease(&rel); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	page, err := db.ListReleaseHistory("prod", 50, 0, "")
+	if err != nil {
+		t.Fatalf("list history: %v", err)
+	}
+	if len(page.Releases) != 2 || page.HasNext {
+		t.Fatalf("page = %+v, want both prod rows and no continuation", page)
+	}
+}

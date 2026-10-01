@@ -28,6 +28,8 @@ func NewRouter(deps Dependencies) *gin.Engine {
 	engine.GET("/releases/:environment/:version", getRelease(deps))
 	engine.GET("/environments/:environment/history", getHistory(deps))
 	engine.GET("/compare", compareEnvironments(deps))
+	engine.GET("/release-comparisons", compareReleases(deps))
+	engine.GET("/environments/:environment/release-history", getReleaseHistoryPage(deps))
 	apiv1.Register(engine, apiv1.Dependencies{Store: deps.Store})
 	return engine
 }
