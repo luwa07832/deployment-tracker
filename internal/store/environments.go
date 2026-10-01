@@ -16,6 +16,13 @@ const (
 	CodeReleaseVersionNotFoundV1 = "RELEASE_VERSION_NOT_FOUND"
 	CodeReleaseRecordNotFoundV1  = "RELEASE_RECORD_NOT_FOUND"
 	CodeEnvironmentValidationV1  = "ENVIRONMENT_VALIDATION_FAILED"
+
+	// Release promotion chain API (batch-scoped).
+	CodeReleaseBatchNotFoundV1     = "RELEASE_BATCH_NOT_FOUND"
+	CodePromotionSequenceInvalidV1 = "INVALID_PROMOTION_SEQUENCE"
+	CodePromotionOrderConflictV1   = "PROMOTION_ORDER_CONFLICT"
+	CodeSamePromotionNodeV1        = "SAME_PROMOTION_NODE"
+	CodePromotionChangeNotFoundV1  = "PROMOTION_CHANGE_NOT_FOUND"
 )
 
 // TrackedEnvironment is an environment that may receive release records.

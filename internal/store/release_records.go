@@ -22,6 +22,7 @@ type ReleaseRecord struct {
 	PublicID      string
 	Environment   string
 	Version       string
+	BatchID       string
 	GateStatus    string
 	RollbackPoint string
 	Changes       []ChangeEntry
@@ -33,12 +34,13 @@ type ReleaseRecord struct {
 type ReleaseRecordFilter struct {
 	Environment string
 	Version     string
+	BatchID     string
 	GateStatus  string
 	From        string
 	To          string
 }
 
-const releaseRecordColumns = `public_id, environment, version, gate_status, rollback_point, recorded_at`
+const releaseRecordColumns = `public_id, environment, version, batch_id, gate_status, rollback_point, recorded_at`
 
 // ErrReleaseAlreadyExists marks a duplicate (environment, version) submission.
 type ErrReleaseAlreadyExists struct {
@@ -54,6 +56,23 @@ func (e *ErrReleaseAlreadyExists) Error() string {
 // identifier and server-side recorded_at. A duplicate (environment, version)
 // pair returns *ErrReleaseAlreadyExists.
 func (s *Store) InsertReleaseRecord(record *ReleaseRecord) error {
+	// The batch-aware partial indexes keep unbatched rows unique on
+	// (environment, version) and batched rows unique per batch. Rows of the
+	// other batch flavor sharing the same environment and version still
+	// represent the same single effective release, so they conflict too.
+	var existing int
+	if err := s.db.QueryRow(
+		`SELECT count(1) FROM release_records
+		 WHERE environment = ? AND version = ?
+		   AND (batch_id = '' OR ? = '')
+		   AND batch_id != ?`,
+		record.Environment, record.Version, record.BatchID, record.BatchID,
+	).Scan(&existing); err != nil {
+		return fmt.Errorf("store: check release record: %w", err)
+	}
+	if existing > 0 {
+		return &ErrReleaseAlreadyExists{Environment: record.Environment, Version: record.Version}
+	}
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -62,13 +81,15 @@ func (s *Store) InsertReleaseRecord(record *ReleaseRecord) error {
 			return fmt.Errorf("store: new release id: %w", err)
 		}
 		res, err := s.db.Exec(
-			`INSERT INTO release_records (public_id, environment, version, gate_status, rollback_point)
-			 VALUES (?, ?, ?, ?, ?)`,
-			id, record.Environment, record.Version, record.GateStatus, record.RollbackPoint,
+			`INSERT INTO release_records (public_id, environment, version, batch_id, gate_status, rollback_point)
+			 VALUES (?, ?, ?, ?, ?, ?)`,
+			id, record.Environment, record.Version, record.BatchID, record.GateStatus, record.RollbackPoint,
 		)
 		if err != nil {
 			if isUniqueViolation(err) {
-				if strings.Contains(strings.ToLower(err.Error()), "release_records.environment") {
+				message := strings.ToLower(err.Error())
+				if strings.Contains(message, "release_records.environment") ||
+					strings.Contains(message, "release_records_env_version") {
 					return &ErrReleaseAlreadyExists{Environment: record.Environment, Version: record.Version}
 				}
 				lastErr = err
@@ -135,6 +156,10 @@ func (s *Store) ListReleaseRecords(filter ReleaseRecordFilter) ([]ReleaseRecord,
 		where = append(where, `r.version = ?`)
 		args = append(args, filter.Version)
 	}
+	if filter.BatchID != "" {
+		where = append(where, `r.batch_id = ?`)
+		args = append(args, filter.BatchID)
+	}
 	if filter.GateStatus != "" {
 		where = append(where, `r.gate_status = ?`)
 		args = append(args, filter.GateStatus)
@@ -196,7 +221,7 @@ func (s *Store) queryReleaseRecords(query string, args ...any) ([]ReleaseRecord,
 		var sequence sql.NullInt64
 		var category, title, description sql.NullString
 		if err := rows.Scan(
-			&record.PublicID, &record.Environment, &record.Version, &record.GateStatus,
+			&record.PublicID, &record.Environment, &record.Version, &record.BatchID, &record.GateStatus,
 			&record.RollbackPoint, &record.RecordedAt,
 			&sequence, &category, &title, &description,
 		); err != nil {
@@ -240,4 +265,16 @@ func isUniqueViolation(err error) bool {
 	}
 	message := strings.ToLower(err.Error())
 	return strings.Contains(message, "constraint failed") && strings.Contains(message, "unique")
+}
+
+// ReleaseBatchExists reports whether at least one release record is stored
+// for the given batch identifier.
+func (s *Store) ReleaseBatchExists(batchID string) (bool, error) {
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT count(1) FROM release_records WHERE batch_id = ?`, batchID,
+	).Scan(&count); err != nil {
+		return false, fmt.Errorf("store: check release batch: %w", err)
+	}
+	return count > 0, nil
 }

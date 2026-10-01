@@ -126,10 +126,10 @@ CREATE TABLE IF NOT EXISTS release_records (
   public_id      TEXT    NOT NULL UNIQUE,
   environment    TEXT    NOT NULL,
   version        TEXT    NOT NULL,
+  batch_id       TEXT    NOT NULL DEFAULT '',
   gate_status    TEXT    NOT NULL,
   rollback_point TEXT    NOT NULL,
-  recorded_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-  UNIQUE (environment, version)
+  recorded_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE TABLE IF NOT EXISTS release_change_entries (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,7 +143,119 @@ CREATE TABLE IF NOT EXISTS release_change_entries (
 	if _, err := s.db.Exec(trackedSchema); err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
 	}
+	batchColumnExists, err := s.columnExists("release_records", "batch_id")
+	if err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	if !batchColumnExists {
+		if _, err := s.db.Exec(`ALTER TABLE release_records ADD COLUMN batch_id TEXT NOT NULL DEFAULT ''`); err != nil {
+			return fmt.Errorf("store: migrate: %w", err)
+		}
+	}
+	// Databases created before release batches kept a table-level
+	// UNIQUE (environment, version) constraint. Batched records must stay
+	// isolated per batch identifier, so that constraint is replaced by two
+	// partial unique indexes: one covering legacy unbatched rows and one
+	// scoping (environment, version) duplicates inside a single batch.
+	if err := s.migrateReleaseBatchIndexes(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// migrateReleaseBatchIndexes swaps the old UNIQUE (environment, version)
+// table constraint for batch-aware partial unique indexes. It is idempotent.
+func (s *Store) migrateReleaseBatchIndexes() error {
+	rows, err := s.db.Query(`PRAGMA index_list('release_records')`)
+	if err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	type indexInfo struct {
+		name   string
+		unique int
+		origin string
+	}
+	var indexes []indexInfo
+	for rows.Next() {
+		var seq, unique int
+		var name, origin, partial sql.NullString
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			rows.Close()
+			return fmt.Errorf("store: migrate: %w", err)
+		}
+		indexes = append(indexes, indexInfo{name: name.String, unique: unique, origin: origin.String})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	needsRebuild := false
+	for _, index := range indexes {
+		// Origin "u" marks an index created by a table UNIQUE constraint;
+		// SQLite cannot drop such an index directly, so the table is rebuilt.
+		if index.origin != "u" || index.unique != 1 {
+			continue
+		}
+		columns, err := s.indexColumns(index.name)
+		if err != nil {
+			return err
+		}
+		if len(columns) == 2 && columns[0] == "environment" && columns[1] == "version" {
+			needsRebuild = true
+		}
+	}
+	if needsRebuild {
+		const rebuild = `
+CREATE TABLE release_records_new (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_id      TEXT    NOT NULL UNIQUE,
+  environment    TEXT    NOT NULL,
+  version        TEXT    NOT NULL,
+  batch_id       TEXT    NOT NULL DEFAULT '',
+  gate_status    TEXT    NOT NULL,
+  rollback_point TEXT    NOT NULL,
+  recorded_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+INSERT INTO release_records_new
+  (id, public_id, environment, version, batch_id, gate_status, rollback_point, recorded_at)
+  SELECT id, public_id, environment, version, batch_id, gate_status, rollback_point, recorded_at
+  FROM release_records;
+DROP TABLE release_records;
+ALTER TABLE release_records_new RENAME TO release_records;
+`
+		if _, err := s.db.Exec(rebuild); err != nil {
+			return fmt.Errorf("store: migrate: %w", err)
+		}
+	}
+	const partialIndexes = `
+CREATE UNIQUE INDEX IF NOT EXISTS release_records_env_version_unbatched
+  ON release_records (environment, version) WHERE batch_id = '';
+CREATE UNIQUE INDEX IF NOT EXISTS release_records_env_version_batch
+  ON release_records (environment, version, batch_id) WHERE batch_id != '';
+`
+	if _, err := s.db.Exec(partialIndexes); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
+	return nil
+}
+
+// indexColumns returns the columns covered by an index in index order.
+func (s *Store) indexColumns(indexName string) ([]string, error) {
+	rows, err := s.db.Query(`PRAGMA index_info('` + indexName + `')`)
+	if err != nil {
+		return nil, fmt.Errorf("store: migrate: %w", err)
+	}
+	defer rows.Close()
+	var columns []string
+	for rows.Next() {
+		var tableOffset, columnOrder int
+		var name sql.NullString
+		if err := rows.Scan(&tableOffset, &columnOrder, &name); err != nil {
+			return nil, fmt.Errorf("store: migrate: %w", err)
+		}
+		columns = append(columns, name.String)
+	}
+	return columns, rows.Err()
 }
 
 // columnExists reports whether the named column is present on the table.

@@ -25,6 +25,7 @@ type changeEntryInput struct {
 type createRecordInput struct {
 	Environment   *string             `json:"environment"`
 	Version       *string             `json:"version"`
+	BatchID       *string             `json:"batch_id"`
 	Changes       *[]changeEntryInput `json:"changes"`
 	GateStatus    *string             `json:"gate_status"`
 	RollbackPoint *string             `json:"rollback_point"`
@@ -41,6 +42,7 @@ type recordView struct {
 	ID            string            `json:"id"`
 	Environment   string            `json:"environment"`
 	Version       string            `json:"version"`
+	BatchID       string            `json:"batch_id,omitempty"`
 	GateStatus    string            `json:"gate_status"`
 	RollbackPoint string            `json:"rollback_point"`
 	Changes       []changeEntryView `json:"changes"`
@@ -52,6 +54,7 @@ func toRecordView(record *store.ReleaseRecord) recordView {
 		ID:            record.PublicID,
 		Environment:   record.Environment,
 		Version:       record.Version,
+		BatchID:       record.BatchID,
 		GateStatus:    record.GateStatus,
 		RollbackPoint: record.RollbackPoint,
 		Changes:       make([]changeEntryView, 0, len(record.Changes)),
@@ -122,6 +125,16 @@ func validateRecordInput(input *createRecordInput) (*store.ReleaseRecord, string
 	if input.Version == nil || strings.TrimSpace(*input.Version) == "" {
 		return nil, "version is required"
 	}
+	batchID := ""
+	if input.BatchID != nil {
+		batchID = strings.TrimSpace(*input.BatchID)
+		if batchID == "" {
+			return nil, "batch_id must not be blank when provided"
+		}
+		if len(batchID) > 200 {
+			return nil, "batch_id must be at most 200 characters"
+		}
+	}
 	if input.Changes == nil {
 		return nil, "changes is required"
 	}
@@ -178,6 +191,7 @@ func validateRecordInput(input *createRecordInput) (*store.ReleaseRecord, string
 	return &store.ReleaseRecord{
 		Environment:   strings.TrimSpace(*input.Environment),
 		Version:       strings.TrimSpace(*input.Version),
+		BatchID:       batchID,
 		GateStatus:    gateStatus,
 		RollbackPoint: strings.TrimSpace(*input.RollbackPoint),
 		Changes:       entries,
@@ -191,6 +205,7 @@ func listReleaseRecords(deps Dependencies) gin.HandlerFunc {
 		filter := store.ReleaseRecordFilter{
 			Environment: environment,
 			Version:     strings.TrimSpace(c.Query("version")),
+			BatchID:     strings.TrimSpace(c.Query("batch_id")),
 			GateStatus:  strings.TrimSpace(c.Query("gate_status")),
 		}
 		if environment != "" && !requireEnvironment(c, deps, environment) {

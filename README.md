@@ -164,14 +164,14 @@ go run .
 }
 ```
 
-- `environment`、`version`、`changes`、`gate_status`、`rollback_point` 均为必填；`changes` 为数组（允许空数组）。
+- `environment`、`version`、`changes`、`gate_status`、`rollback_point` 均为必填；`changes` 为数组（允许空数组）。`batch_id` 为可选：非空白字符串，最长 200 个字符，用于发布晋级链路（见下文）；空白但非省略时按校验失败处理。
 - 每个变更条目的 `category`、`title`、`description` 为必填非空字符串；`sequence` 为可选正整数。要么所有条目都带 `sequence`（且互不相同），要么全部省略——全省略时服务端按数组顺序从 1 编号。
 - `gate_status` 只接受 `allowed`、`blocked`、`pending`。
 - `rollback_point` 是公开入口中的稳定标识，服务端只原样保存，不推断、不读取或生成任何文件内容。
 - 成功返回 201 与 `{"release_record": {...}}`，记录包含：
   - `id`：稳定记录标识，形如 `rel_` 加 32 个十六进制字符（不暴露数据库主键）；
   - `recorded_at`：服务端生成的记录时间，UTC，`YYYY-MM-DDTHH:MM:SSZ`；
-  - 完整的 `environment`、`version`、`changes`、`gate_status`、`rollback_point`。
+  - 完整的 `environment`、`version`、`changes`、`gate_status`、`rollback_point`；写入时提供了 `batch_id` 时还包含该字段。
 - 写入成功后立即可由下面的查询入口与差异比对读取。
 
 错误码（错误体仍只有 `error` 一个顶层键）：
@@ -180,7 +180,7 @@ go run .
 |---|---|---|
 | 目标环境未登记 | 404 | `ENVIRONMENT_NOT_FOUND` |
 | 同一环境同一版本重复提交 | 409 | `RELEASE_ALREADY_EXISTS` |
-| 必填字段缺失、类型不符、`sequence` 非法或重复、门禁枚举非法、回滚点为空白 | 422 | `RELEASE_VALIDATION_FAILED` |
+| 必填字段缺失、类型不符、`sequence` 非法或重复、门禁枚举非法、回滚点为空白、`batch_id` 为空白或超长 | 422 | `RELEASE_VALIDATION_FAILED` |
 | 请求体不是合法 JSON | 400 | `invalid_request` |
 
 ### `GET /api/v1/release-records`
@@ -193,6 +193,7 @@ go run .
 | `version` | 精确版本 |
 | `gate_status` | 门禁状态；非枚举值返回 422 `RELEASE_VALIDATION_FAILED` |
 | `recorded_from` / `recorded_to` | 记录时间闭区间，支持 RFC3339 时刻或 `YYYY-MM-DD` 日期（日期分别取当日 00:00:00 / 23:59:59 UTC）；无法解析返回 422 `RELEASE_VALIDATION_FAILED` |
+| `batch_id` | 精确匹配发布批次标识（仅写入时携带该字段的记录） |
 
 返回 200 `{"release_records":[...]}`，按 `recorded_at` 倒序；同一时刻再按写入顺序倒序，保证结果确定。空结果为 `[]`。
 
@@ -253,3 +254,115 @@ go run .
 | 任一环境未登记 | 404 | `ENVIRONMENT_NOT_FOUND` |
 
 这些问题不会被静默折叠成空结果。
+
+## 发布批次与晋级链路 API（/api/v1）
+
+发布记录可以携带可选的 `batch_id`，用于把同一发布批次在多个环境中的发布事实关联成一条晋级链路。它只是发布记录上的稳定标识：不改变写入、单记录查询和环境差异比对的既有语义。
+
+### 发布记录上的批次标识
+
+- `POST /api/v1/release-records` 的请求体新增**可选**字段 `batch_id`：非空白字符串，最长 200 个字符。省略或为空字符串（不提供该字段）时记录为无批次记录，响应形状与以前完全一致（不出现 `batch_id` 键）。
+- 无批次记录仍要求同一 `environment` + `version` 唯一；带批次记录按 `(environment, version, batch_id)` 唯一：**不同批次复用同一环境同一版本互不冲突**，但同一批次在同一环境重复提交同一版本仍返回 409 `RELEASE_ALREADY_EXISTS`；带批次与无批次记录占用同一个 `(environment, version)` 时也返回 409，二者不能并存。
+- 成功响应中的记录在带批次时额外包含 `"batch_id": "..."`；`GET /api/v1/release-records` 新增可选过滤参数 `batch_id`（精确匹配，与其它过滤条件 AND 组合）。
+- 批次隔离是硬边界：链路、差异与追溯只读取同一 `batch_id` 的发布事实，多个批次复用同一版本也不会被合并成别的链路。
+
+### `GET /api/v1/release-batches/{batch_id}/promotion-chain`
+
+查询参数 `environments` 为逗号分隔的**有序**环境序列，例如 `dev,test,staging,prod`。返回该批次按晋级顺序排列的完整链路：
+
+```json
+{
+  "batch_id": "b-2026-10-01",
+  "environments": ["dev", "test", "staging", "prod"],
+  "nodes": [
+    {
+      "environment": "dev",
+      "releases": [
+        {"id": "rel_…", "environment": "dev", "version": "1.0.0",
+         "gate_status": "allowed", "rollback_point": "snap:0.9.0",
+         "changes": [{"sequence": 1, "category": "feature", "title": "alpha", "description": "…"}],
+         "recorded_at": "2026-10-01T08:00:00Z"}
+      ],
+      "effective_release": { "...": "该节点登记顺序最后的发布事实" }
+    }
+  ],
+  "segment_diffs": [
+    {
+      "from_environment": "dev",
+      "to_environment": "test",
+      "added_changes": [ { "…变更条目…": "下游有、上游无（按 title 排序）" } ],
+      "missing_changes": [ { "…变更条目…": "上游有、下游无（按 title 排序）" } ],
+      "inconsistent_changes": [
+        {"left": {"…变更条目…": "上游"}, "right": {"…变更条目…": "下游（title 相同但 sequence/category/description 不同）"}}
+      ],
+      "version": {"left": "1.0.0", "right": "1.0.1", "changed": true},
+      "gate_status": {"left": "allowed", "right": "blocked", "changed": true},
+      "rollback_point": {"left": "snap:0.9.0", "right": "snap:0.8.0", "changed": true}
+    }
+  ],
+  "consistent": false
+}
+```
+
+约定：
+
+- `nodes` 顺序就是请求的环境顺序；同一节点在批次内有多次发布时，`releases` 按发布时间从旧到新**完整列出**，绝不只保留最后一次；同一秒写入的多次发布按写入顺序稳定排列。
+- `effective_release` 是该节点登记顺序最后的发布事实，逐段差异基于相邻节点的有效事实计算。
+- `segment_diffs` 只包含存在确定差异的相邻段，按链路顺序排列；无任何差异时为确定的空数组 `[]`，此时 `consistent` 为 `true`。只要任一段存在变更条目的新增、缺失、不一致，或版本分歧、门禁事实冲突、回滚点不一致，`consistent` 即为 `false`，并分别给出确定的差异类别，不合并成笼统结果。
+- 变更条目以稳定标识 `title` 识别（与既有环境差异比对一致）；差异中的变更列表按 `title` 字典序排列；节点发布事实中的变更保留记录里的原始顺序。
+- 时间（`recorded_at`）与版本字符串沿用服务既有格式；响应不含服务端生成时刻，相同输入重复查询结果逐字节一致。
+- 查询不写任何数据，不改写历史记录。
+
+### `GET /api/v1/release-batches/{batch_id}/promotion-diff?from=<env>&to=<env>`
+
+从任意两个环境节点生成**局部晋级差异**（不要求相邻）。响应：
+
+```json
+{
+  "batch_id": "b-2026-10-01",
+  "from_environment": "dev",
+  "to_environment": "staging",
+  "from_release": { "…发布事实…": "from 节点的有效发布" },
+  "to_release": { "…发布事实…": "to 节点的有效发布" },
+  "diff": { "…与链路中 segment_diffs 完全相同的逐段差异形状…": "" },
+  "consistent": false
+}
+```
+
+`diff` 内各类别字段始终存在（无差异时为空数组或 `"changed": false`），`consistent` 语义与链路查询一致。
+
+### `GET /api/v1/release-batches/{batch_id}/changes/{title}/trace?environments=dev,test,staging,prod`
+
+按变更条目稳定标识 `title` 追溯它在链路中的走向：
+
+```json
+{
+  "batch_id": "b-2026-10-01",
+  "change_title": "beta",
+  "first_environment": "dev",
+  "first_entered_at": "2026-10-01T08:00:00Z",
+  "environments": ["dev", "test", "staging", "prod"],
+  "passed_environments": ["dev", "test"],
+  "first_missing_environment": "staging"
+}
+```
+
+- `first_environment` 是序列中首个有效发布包含该条目的节点；`first_entered_at` 是该节点最早一次包含该条目的发布时间。
+- `passed_environments` 从首次进入节点起、沿晋级方向连续包含该条目的节点；`first_missing_environment` 是其后首个不再包含该条目的节点；一直存在到序列末尾时为空字符串 `""`。
+- 该条目在批次的所有请求节点中都不存在时返回 404 `PROMOTION_CHANGE_NOT_FOUND`。
+
+### 晋级链路错误码
+
+三个查询入口共用统一的校验顺序与错误形状（仍只有 `error` 一个顶层键）：
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| 批次在所有发布记录中都不存在（唯一可观察的批次 NotFound） | 404 | `RELEASE_BATCH_NOT_FOUND` |
+| `environments` 缺失、为空、含空段或含重复环境（消息中指出冲突环境） | 400 | `INVALID_PROMOTION_SEQUENCE` |
+| 序列包含未登记环境（消息中指出未知环境） | 400 | `INVALID_PROMOTION_SEQUENCE` |
+| 请求节点在该批次内没有发布事实，无法确定先后顺序（消息中指出缺顺序信息的节点） | 409 | `PROMOTION_ORDER_CONFLICT` |
+| 局部差异缺少 `from`/`to` | 400 | `INVALID_PROMOTION_SEQUENCE` |
+| 局部差异 `from` 与 `to` 相同 | 400 | `SAME_PROMOTION_NODE` |
+| 追溯的变更条目不属于该批次 | 404 | `PROMOTION_CHANGE_NOT_FOUND` |
+
+单元素环境序列是合法的：链路返回一个节点、空 `segment_diffs` 与 `consistent: true`。序列校验先于批次存在性检查，因此未知批次配重复/未知环境时仍返回 400；批次存在性先于节点顺序检查。
