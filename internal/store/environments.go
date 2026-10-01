@@ -8,14 +8,18 @@ import (
 // Error codes introduced for the traceable release-record API. Values are
 // stable public identifiers; they are returned verbatim in error responses.
 const (
-	CodeEnvironmentNotFoundV1    = "ENVIRONMENT_NOT_FOUND"
-	CodeReleaseAlreadyExistsV1   = "RELEASE_ALREADY_EXISTS"
-	CodeReleaseValidationV1      = "RELEASE_VALIDATION_FAILED"
-	CodeSameEnvironmentCompareV1 = "SAME_ENVIRONMENT_COMPARE"
-	CodeInvalidCompareRangeV1    = "INVALID_COMPARE_RANGE"
-	CodeReleaseVersionNotFoundV1 = "RELEASE_VERSION_NOT_FOUND"
-	CodeReleaseRecordNotFoundV1  = "RELEASE_RECORD_NOT_FOUND"
-	CodeEnvironmentValidationV1  = "ENVIRONMENT_VALIDATION_FAILED"
+	CodeEnvironmentNotFoundV1       = "ENVIRONMENT_NOT_FOUND"
+	CodeReleaseAlreadyExistsV1      = "RELEASE_ALREADY_EXISTS"
+	CodeReleaseValidationV1         = "RELEASE_VALIDATION_FAILED"
+	CodeSameEnvironmentCompareV1    = "SAME_ENVIRONMENT_COMPARE"
+	CodeInvalidCompareRangeV1       = "INVALID_COMPARE_RANGE"
+	CodeReleaseVersionNotFoundV1    = "RELEASE_VERSION_NOT_FOUND"
+	CodeReleaseRecordNotFoundV1     = "RELEASE_RECORD_NOT_FOUND"
+	CodeEnvironmentValidationV1     = "ENVIRONMENT_VALIDATION_FAILED"
+	CodeReleaseBatchNotFoundV1      = "RELEASE_BATCH_NOT_FOUND"
+	CodeDuplicateEnvironmentChainV1 = "DUPLICATE_ENVIRONMENT_IN_SEQUENCE"
+	CodeUnknownEnvironmentChainV1   = "UNKNOWN_ENVIRONMENT_IN_SEQUENCE"
+	CodePromotionChainConflictV1    = "PROMOTION_CHAIN_ORDER_CONFLICT"
 )
 
 // TrackedEnvironment is an environment that may receive release records.

@@ -23,4 +23,7 @@ func Register(engine *gin.Engine, deps Dependencies) {
 	group.GET("/release-records", listReleaseRecords(deps))
 	group.GET("/release-records/:id", getReleaseRecord(deps))
 	group.GET("/compare", compareEnvironments(deps))
+	group.GET("/release-batches/:batch_id/chain", getPromotionChain(deps))
+	group.GET("/release-batches/:batch_id/promotion-diff", getLocalPromotionDiff(deps))
+	group.GET("/release-batches/:batch_id/changes/:change_id/trace", getChangeTrace(deps))
 }

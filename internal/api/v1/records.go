@@ -28,6 +28,7 @@ type createRecordInput struct {
 	Changes       *[]changeEntryInput `json:"changes"`
 	GateStatus    *string             `json:"gate_status"`
 	RollbackPoint *string             `json:"rollback_point"`
+	BatchID       *string             `json:"batch_id"`
 }
 
 type changeEntryView struct {
@@ -43,6 +44,7 @@ type recordView struct {
 	Version       string            `json:"version"`
 	GateStatus    string            `json:"gate_status"`
 	RollbackPoint string            `json:"rollback_point"`
+	BatchID       string            `json:"batch_id,omitempty"`
 	Changes       []changeEntryView `json:"changes"`
 	RecordedAt    string            `json:"recorded_at"`
 }
@@ -54,6 +56,7 @@ func toRecordView(record *store.ReleaseRecord) recordView {
 		Version:       record.Version,
 		GateStatus:    record.GateStatus,
 		RollbackPoint: record.RollbackPoint,
+		BatchID:       record.BatchID,
 		Changes:       make([]changeEntryView, 0, len(record.Changes)),
 		RecordedAt:    record.RecordedAt,
 	}
@@ -135,6 +138,16 @@ func validateRecordInput(input *createRecordInput) (*store.ReleaseRecord, string
 	if input.RollbackPoint == nil || strings.TrimSpace(*input.RollbackPoint) == "" {
 		return nil, "rollback_point is required"
 	}
+	batchID := ""
+	if input.BatchID != nil {
+		batchID = strings.TrimSpace(*input.BatchID)
+		if batchID == "" {
+			return nil, "batch_id must not be blank"
+		}
+		if len(batchID) > 128 {
+			return nil, "batch_id must be at most 128 characters"
+		}
+	}
 	rawEntries := *input.Changes
 	entries := make([]store.ChangeEntry, 0, len(rawEntries))
 	explicit := false
@@ -180,6 +193,7 @@ func validateRecordInput(input *createRecordInput) (*store.ReleaseRecord, string
 		Version:       strings.TrimSpace(*input.Version),
 		GateStatus:    gateStatus,
 		RollbackPoint: strings.TrimSpace(*input.RollbackPoint),
+		BatchID:       batchID,
 		Changes:       entries,
 	}, ""
 }
@@ -192,6 +206,7 @@ func listReleaseRecords(deps Dependencies) gin.HandlerFunc {
 			Environment: environment,
 			Version:     strings.TrimSpace(c.Query("version")),
 			GateStatus:  strings.TrimSpace(c.Query("gate_status")),
+			BatchID:     strings.TrimSpace(c.Query("batch_id")),
 		}
 		if environment != "" && !requireEnvironment(c, deps, environment) {
 			return

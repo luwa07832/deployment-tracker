@@ -24,6 +24,7 @@ type ReleaseRecord struct {
 	Version       string
 	GateStatus    string
 	RollbackPoint string
+	BatchID       string
 	Changes       []ChangeEntry
 	RecordedAt    string
 }
@@ -34,11 +35,12 @@ type ReleaseRecordFilter struct {
 	Environment string
 	Version     string
 	GateStatus  string
+	BatchID     string
 	From        string
 	To          string
 }
 
-const releaseRecordColumns = `public_id, environment, version, gate_status, rollback_point, recorded_at`
+const releaseRecordColumns = `public_id, environment, version, gate_status, rollback_point, batch_id, recorded_at`
 
 // ErrReleaseAlreadyExists marks a duplicate (environment, version) submission.
 type ErrReleaseAlreadyExists struct {
@@ -61,18 +63,30 @@ func (s *Store) InsertReleaseRecord(record *ReleaseRecord) error {
 		if err != nil {
 			return fmt.Errorf("store: new release id: %w", err)
 		}
+		var batchArg any
+		if record.BatchID != "" {
+			batchArg = record.BatchID
+		}
+		var recordedArg any
+		if record.RecordedAt != "" {
+			recordedArg = record.RecordedAt
+		}
 		res, err := s.db.Exec(
-			`INSERT INTO release_records (public_id, environment, version, gate_status, rollback_point)
-			 VALUES (?, ?, ?, ?, ?)`,
-			id, record.Environment, record.Version, record.GateStatus, record.RollbackPoint,
+			`INSERT INTO release_records (public_id, environment, version, gate_status, rollback_point, batch_id, recorded_at)
+			 VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%SZ','now')))`,
+			id, record.Environment, record.Version, record.GateStatus, record.RollbackPoint, batchArg, recordedArg,
 		)
 		if err != nil {
 			if isUniqueViolation(err) {
-				if strings.Contains(strings.ToLower(err.Error()), "release_records.environment") {
-					return &ErrReleaseAlreadyExists{Environment: record.Environment, Version: record.Version}
+				collision, collisionErr := s.publicIDExists(id)
+				if collisionErr != nil {
+					return collisionErr
 				}
-				lastErr = err
-				continue
+				if collision {
+					lastErr = err
+					continue
+				}
+				return &ErrReleaseAlreadyExists{Environment: record.Environment, Version: record.Version}
 			}
 			return fmt.Errorf("store: insert release record: %w", err)
 		}
@@ -139,6 +153,10 @@ func (s *Store) ListReleaseRecords(filter ReleaseRecordFilter) ([]ReleaseRecord,
 		where = append(where, `r.gate_status = ?`)
 		args = append(args, filter.GateStatus)
 	}
+	if filter.BatchID != "" {
+		where = append(where, `r.batch_id = ?`)
+		args = append(args, filter.BatchID)
+	}
 	if filter.From != "" {
 		where = append(where, `r.recorded_at >= ?`)
 		args = append(args, filter.From)
@@ -194,14 +212,15 @@ func (s *Store) queryReleaseRecords(query string, args ...any) ([]ReleaseRecord,
 	for rows.Next() {
 		var record ReleaseRecord
 		var sequence sql.NullInt64
-		var category, title, description sql.NullString
+		var category, title, description, batchID sql.NullString
 		if err := rows.Scan(
 			&record.PublicID, &record.Environment, &record.Version, &record.GateStatus,
-			&record.RollbackPoint, &record.RecordedAt,
+			&record.RollbackPoint, &batchID, &record.RecordedAt,
 			&sequence, &category, &title, &description,
 		); err != nil {
 			return nil, fmt.Errorf("store: scan release record: %w", err)
 		}
+		record.BatchID = batchID.String
 		pos, seen := indexByID[record.PublicID]
 		if !seen {
 			record.Changes = []ChangeEntry{}
@@ -222,6 +241,43 @@ func (s *Store) queryReleaseRecords(query string, args ...any) ([]ReleaseRecord,
 		return nil, fmt.Errorf("store: query release records: %w", err)
 	}
 	return records, nil
+}
+
+// publicIDExists reports whether a record already carries the given public id.
+func (s *Store) publicIDExists(publicID string) (bool, error) {
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT count(1) FROM release_records WHERE public_id = ?`, publicID,
+	).Scan(&count); err != nil {
+		return false, fmt.Errorf("store: check release record id: %w", err)
+	}
+	return count > 0, nil
+}
+
+// BatchExists reports whether at least one release record carries the batch id.
+func (s *Store) BatchExists(batchID string) (bool, error) {
+	var count int
+	if err := s.db.QueryRow(
+		`SELECT count(1) FROM release_records WHERE batch_id = ?`, batchID,
+	).Scan(&count); err != nil {
+		return false, fmt.Errorf("store: check release batch: %w", err)
+	}
+	return count > 0, nil
+}
+
+// ListBatchReleaseRecords returns every record tagged with the batch id in
+// chronological (oldest first) order; equal timestamps break ties by the
+// stable insertion order so repeated queries are deterministic.
+func (s *Store) ListBatchReleaseRecords(batchID string) ([]ReleaseRecord, error) {
+	return s.queryReleaseRecords(
+		`SELECT r.`+strings.ReplaceAll(releaseRecordColumns, ", ", ", r.")+
+			`, e.sequence_no, e.category, e.title, e.description
+		 FROM release_records r
+		 LEFT JOIN release_change_entries e ON e.record_id = r.id
+		 WHERE r.batch_id = ?
+		 ORDER BY r.recorded_at ASC, r.id ASC, e.sequence_no ASC, e.id ASC`,
+		batchID,
+	)
 }
 
 // newPublicID returns an opaque stable identifier for a release record.

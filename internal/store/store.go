@@ -128,8 +128,8 @@ CREATE TABLE IF NOT EXISTS release_records (
   version        TEXT    NOT NULL,
   gate_status    TEXT    NOT NULL,
   rollback_point TEXT    NOT NULL,
-  recorded_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
-  UNIQUE (environment, version)
+  batch_id       TEXT,
+  recorded_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 CREATE TABLE IF NOT EXISTS release_change_entries (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -143,7 +143,126 @@ CREATE TABLE IF NOT EXISTS release_change_entries (
 	if _, err := s.db.Exec(trackedSchema); err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
 	}
+	if err := s.migrateReleaseRecordBatches(); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
 	return nil
+}
+
+// migrateReleaseRecordBatches adds the optional batch_id grouping used by the
+// promotion-chain read endpoints. Records without a batch keep the original
+// (environment, version) uniqueness through a partial index; batch records
+// are isolated per batch. The legacy table-level UNIQUE constraint, when
+// present in an older database, is rebuilt away; stored facts are preserved.
+func (s *Store) migrateReleaseRecordBatches() error {
+	hasBatchColumn, err := s.columnExists("release_records", "batch_id")
+	if err != nil {
+		return err
+	}
+	if !hasBatchColumn {
+		if _, err := s.db.Exec(`ALTER TABLE release_records ADD COLUMN batch_id TEXT`); err != nil {
+			return fmt.Errorf("add batch_id column: %w", err)
+		}
+	}
+	legacyIndex, err := s.tableIndexExists("release_records", true, "environment", "version")
+	if err != nil {
+		return err
+	}
+	if legacyIndex {
+		rebuild := `
+CREATE TABLE release_records_new (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_id      TEXT    NOT NULL UNIQUE,
+  environment    TEXT    NOT NULL,
+  version        TEXT    NOT NULL,
+  gate_status    TEXT    NOT NULL,
+  rollback_point TEXT    NOT NULL,
+  batch_id       TEXT,
+  recorded_at    TEXT    NOT NULL
+);
+INSERT INTO release_records_new
+  (id, public_id, environment, version, gate_status, rollback_point, batch_id, recorded_at)
+SELECT id, public_id, environment, version, gate_status, rollback_point, batch_id, recorded_at
+FROM release_records;
+DROP TABLE release_records;
+ALTER TABLE release_records_new RENAME TO release_records;
+`
+		if _, err := s.db.Exec(rebuild); err != nil {
+			return fmt.Errorf("rebuild release_records: %w", err)
+		}
+	}
+	indexes := []string{
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_release_records_env_version
+		 ON release_records(environment, version) WHERE batch_id IS NULL`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_release_records_batch
+		 ON release_records(batch_id, environment, version) WHERE batch_id IS NOT NULL`,
+	}
+	for _, statement := range indexes {
+		if _, err := s.db.Exec(statement); err != nil {
+			return fmt.Errorf("create batch index: %w", err)
+		}
+	}
+	return nil
+}
+
+// tableIndexExists reports whether the table has an index whose column
+// prefix matches the requested columns, optionally limited to unique indexes.
+func (s *Store) tableIndexExists(table string, uniqueOnly bool, columns ...string) (bool, error) {
+	rows, err := s.db.Query(`PRAGMA index_list(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	type indexInfo struct {
+		name   string
+		unique bool
+		origin string
+	}
+	var indexes []indexInfo
+	for rows.Next() {
+		var seq, partial int
+		var name, origin string
+		var unique int
+		if err := rows.Scan(&seq, &name, &unique, &origin, &partial); err != nil {
+			rows.Close()
+			return false, err
+		}
+		indexes = append(indexes, indexInfo{name: name, unique: unique == 1, origin: origin})
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	for _, index := range indexes {
+		if uniqueOnly && (!index.unique || index.origin != "u") {
+			continue
+		}
+		columnRows, err := s.db.Query(`PRAGMA index_info(` + index.name + `)`)
+		if err != nil {
+			return false, err
+		}
+		match := true
+		position := 0
+		for columnRows.Next() {
+			var seqno, cid int
+			var name string
+			if err := columnRows.Scan(&seqno, &cid, &name); err != nil {
+				columnRows.Close()
+				return false, err
+			}
+			if position < len(columns) && name != columns[position] {
+				match = false
+			}
+			position++
+		}
+		columnRows.Close()
+		if err := columnRows.Err(); err != nil {
+			return false, err
+		}
+		if match && position >= len(columns) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // columnExists reports whether the named column is present on the table.

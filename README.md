@@ -165,13 +165,14 @@ go run .
 ```
 
 - `environment`、`version`、`changes`、`gate_status`、`rollback_point` 均为必填；`changes` 为数组（允许空数组）。
+- `batch_id` 为可选的发布批次标识（非空白字符串，最长 128 字符）。省略或为空白时记录不属于任何批次，并保持既有的“同一环境同一版本唯一”约束；携带批次时按 `(batch_id, environment, version)` 唯一，因此不同批次可以复用同一版本，同一批次在同一环境也可登记多个不同版本（同一批次内同一版本重复提交仍返回 409）。批次标识是不透明稳定标识，服务端只原样保存，不推断其内容。
 - 每个变更条目的 `category`、`title`、`description` 为必填非空字符串；`sequence` 为可选正整数。要么所有条目都带 `sequence`（且互不相同），要么全部省略——全省略时服务端按数组顺序从 1 编号。
 - `gate_status` 只接受 `allowed`、`blocked`、`pending`。
 - `rollback_point` 是公开入口中的稳定标识，服务端只原样保存，不推断、不读取或生成任何文件内容。
 - 成功返回 201 与 `{"release_record": {...}}`，记录包含：
   - `id`：稳定记录标识，形如 `rel_` 加 32 个十六进制字符（不暴露数据库主键）；
   - `recorded_at`：服务端生成的记录时间，UTC，`YYYY-MM-DDTHH:MM:SSZ`；
-  - 完整的 `environment`、`version`、`changes`、`gate_status`、`rollback_point`。
+  - 完整的 `environment`、`version`、`changes`、`gate_status`、`rollback_point`；登记时携带了批次时还包含 `batch_id`（无批次记录不输出该字段）。
 - 写入成功后立即可由下面的查询入口与差异比对读取。
 
 错误码（错误体仍只有 `error` 一个顶层键）：
@@ -192,6 +193,7 @@ go run .
 | `environment` | 目标环境；未登记时 404 `ENVIRONMENT_NOT_FOUND` |
 | `version` | 精确版本 |
 | `gate_status` | 门禁状态；非枚举值返回 422 `RELEASE_VALIDATION_FAILED` |
+| `batch_id` | 精确发布批次标识；只返回该批次的记录，不影响其它过滤条件 |
 | `recorded_from` / `recorded_to` | 记录时间闭区间，支持 RFC3339 时刻或 `YYYY-MM-DD` 日期（日期分别取当日 00:00:00 / 23:59:59 UTC）；无法解析返回 422 `RELEASE_VALIDATION_FAILED` |
 
 返回 200 `{"release_records":[...]}`，按 `recorded_at` 倒序；同一时刻再按写入顺序倒序，保证结果确定。空结果为 `[]`。
@@ -253,3 +255,112 @@ go run .
 | 任一环境未登记 | 404 | `ENVIRONMENT_NOT_FOUND` |
 
 这些问题不会被静默折叠成空结果。
+
+### 发布晋级链路（只读）
+
+链路入口把同一发布批次（`batch_id`）在多个已登记环境中的发布事实关联起来。它们只读取既有发布记录，绝不写入或改写历史；相同输入的响应逐字节稳定（无服务端时间戳）。变更条目沿用既有结构，其稳定标识为 `title`（与差异比对的识别口径一致）；时间沿用 `recorded_at`，版本沿用点分段版本序。
+
+#### `GET /api/v1/release-batches/{batch_id}/chain?environments=dev,test,staging,prod`
+
+返回整条晋级链路。`environments` 为逗号分隔的有序环境序列。节点内的发布事实按 `recorded_at` 从旧到新完整列出（同一时刻按写入顺序），同一环境在该批次内的多次发布全部保留，不折叠为最后一次；不同批次即使版本相同也严格隔离。
+
+成功返回 200：
+
+```json
+{
+  "batch_id": "b1",
+  "environment_order": ["dev", "test", "staging", "prod"],
+  "nodes": [
+    {
+      "environment": "dev",
+      "releases": [
+        {
+          "id": "rel_...",
+          "environment": "dev",
+          "version": "1.0.0",
+          "gate_status": "allowed",
+          "rollback_point": "snapshot:1.0.0",
+          "changes": [{"sequence": 1, "category": "feature", "title": "a", "description": "..."}],
+          "recorded_at": "2026-09-01T10:00:00Z"
+        }
+      ]
+    }
+  ],
+  "segment_diffs": [
+    {
+      "from_environment": "dev",
+      "to_environment": "test",
+      "consistent": false,
+      "categories": ["missing_changes", "version_divergence"],
+      "version_divergences": [
+        {"version": "0.9.0", "presence": "from", "only_in_from": true, "only_in_to": false},
+        {"version": "1.0.1", "presence": "to", "only_in_from": false, "only_in_to": true}
+      ],
+      "gate_status_conflicts": [{"version": "1.0.0", "from_gate_status": "allowed", "to_gate_status": "blocked"}],
+      "rollback_point_conflicts": [{"version": "1.0.0", "field": "rollback_point", "from": "snap:a", "to": "snap:b"}],
+      "added_changes": [{"sequence": 2, "category": "feature", "title": "c", "description": "..."}],
+      "missing_changes": [{"sequence": 3, "category": "fix", "title": "b", "description": "..."}],
+      "inconsistent_changes": [
+        {"left": {"sequence": 1, "category": "feature", "title": "a", "description": "old"},
+         "right": {"sequence": 1, "category": "feature", "title": "a", "description": "new"}}
+      ]
+    }
+  ],
+  "consistent": false,
+  "inconsistency_categories": ["gate_status_conflict", "missing_changes", "version_divergence"]
+}
+```
+
+- 逐段差异方向固定为 `from_environment` → `to_environment`：`added_changes` 是下游新出现的条目，`missing_changes` 是下游缺失的上游条目，`inconsistent_changes` 是两侧都有但序号、分类或描述不一致的条目（按 `title` 识别）。各列表按稳定标识（`title`）排序，空结果为确定的空数组。
+- `version_divergences` 逐版本列出只存在于一侧的版本；共有版本分别比较门禁状态（`gate_status_conflicts`）与回滚点（`rollback_point_conflicts`）。
+- 相邻节点没有任何差异时，该段所有差异列表为空数组、`consistent` 为 `true`；全部相邻段一致时顶层 `consistent` 为 `true`、`inconsistency_categories` 为空数组。仅存在“新增变更”不会使链路不一致；出现缺失变更、不一致变更、版本分歧、门禁冲突或回滚点不一致时，顶层与对应段的 `consistent` 均为 `false`，`categories` / `inconsistency_categories` 分别给出确定的类别（`missing_changes`、`inconsistent_changes`、`version_divergence`、`gate_status_conflict`、`rollback_point_conflict`），不合并为笼统结果。
+- 顺序可判定性：相邻节点之间必须能由发布事实确定先后。共有版本上，下游该版本最后一次发布必须晚于上游；无共有版本时，下游首个发布必须晚于上游最后一个发布。节点在该批次内没有任何发布事实，或事实证明顺序相反/重叠时，返回 409 `PROMOTION_CHAIN_ORDER_CONFLICT`，消息中逐段列出缺少顺序信息的节点（形如 `dev -> test`）。
+
+#### `GET /api/v1/release-batches/{batch_id}/promotion-diff?from=<env>&to=<env>`
+
+在任意两个环境节点之间生成局部晋级差异，计算口径与链路中的逐段差异完全一致（同样先做顺序可判定性检查）。返回 200：
+
+```json
+{
+  "batch_id": "b1",
+  "from_environment": "staging",
+  "to_environment": "prod",
+  "segment": { "from_environment": "staging", "to_environment": "prod", "consistent": true, "categories": [], "...": "与 chain 的 segment_diffs 元素相同" }
+}
+```
+
+`from` 与 `to` 相同返回 400 `SAME_ENVIRONMENT_COMPARE`；缺少任一参数返回 400 `invalid_request`。
+
+#### `GET /api/v1/release-batches/{batch_id}/changes/{change_id}/trace?environments=dev,test,staging,prod`
+
+按变更条目标识（`title`）追溯它在链路中的传播：首次进入的节点、经过的全部节点，以及首次缺失的节点。`appearances` 按发布时间顺序列出该条目出现的每次发布（保留版本、门禁、回滚点、记录时间）。返回 200：
+
+```json
+{
+  "batch_id": "b1",
+  "change_id": "fix logout",
+  "environment_order": ["dev", "test", "staging", "prod"],
+  "first_present_environment": "dev",
+  "first_missing_environment": "staging",
+  "present_environments": ["dev", "test"],
+  "appearances": [
+    {"environment": "dev", "release_id": "rel_...", "version": "1.0.0",
+     "recorded_at": "2026-09-01T10:00:00Z", "gate_status": "allowed", "rollback_point": "snap:1"}
+  ]
+}
+```
+
+- 条目在整条链路从未出现时不是错误：返回 200，`first_present_environment` 与 `first_missing_environment` 为 `null`，两个列表为空数组。
+- 一个节点的任意一次发布包含该条目即视为“经过”该节点；`first_missing_environment` 取首次出现节点之后第一个不包含该条目的节点，之后再次出现不改变该结果。
+
+#### 链路入口共同的错误约定
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| 批次不存在（三个入口相同的唯一 NotFound 观察） | 404 | `RELEASE_BATCH_NOT_FOUND` |
+| `environments` 序列包含重复环境（消息列出冲突环境） | 400 | `DUPLICATE_ENVIRONMENT_IN_SEQUENCE` |
+| 序列包含未登记环境（消息列出未知环境） | 400 | `UNKNOWN_ENVIRONMENT_IN_SEQUENCE` |
+| 缺少或无法解析环境序列 | 400 | `invalid_request` |
+| 发布事实不足以确定相邻节点先后（消息列出节点段） | 409 | `PROMOTION_CHAIN_ORDER_CONFLICT` |
+
+校验顺序为：请求参数 → 重复/未知环境 → 批次存在性 → 顺序可判定性。局部差异入口的 `from`/`to` 相同使用既有的 `SAME_ENVIRONMENT_COMPARE`。这些查询不改变 `POST /api/v1/release-records`、单记录查询、`/api/v1/compare` 及全部基线入口的既有语义。
