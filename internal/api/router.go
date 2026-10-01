@@ -6,6 +6,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	apiv1 "github.com/luwa07832/deployment-tracker/internal/api/v1"
 	"github.com/luwa07832/deployment-tracker/internal/store"
 )
 
@@ -27,6 +28,7 @@ func NewRouter(deps Dependencies) *gin.Engine {
 	engine.GET("/releases/:environment/:version", getRelease(deps))
 	engine.GET("/environments/:environment/history", getHistory(deps))
 	engine.GET("/compare", compareEnvironments(deps))
+	apiv1.Register(engine, apiv1.Dependencies{Store: deps.Store})
 	return engine
 }
 

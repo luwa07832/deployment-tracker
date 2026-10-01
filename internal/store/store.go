@@ -114,6 +114,35 @@ CREATE TABLE IF NOT EXISTS deployments (
 			return fmt.Errorf("store: migrate: %w", err)
 		}
 	}
+	const trackedSchema = `
+CREATE TABLE IF NOT EXISTS tracked_environments (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  environment   TEXT    NOT NULL UNIQUE,
+  display_name  TEXT    NOT NULL DEFAULT '',
+  registered_at TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE TABLE IF NOT EXISTS release_records (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  public_id      TEXT    NOT NULL UNIQUE,
+  environment    TEXT    NOT NULL,
+  version        TEXT    NOT NULL,
+  gate_status    TEXT    NOT NULL,
+  rollback_point TEXT    NOT NULL,
+  recorded_at    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  UNIQUE (environment, version)
+);
+CREATE TABLE IF NOT EXISTS release_change_entries (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_id   INTEGER NOT NULL REFERENCES release_records(id),
+  sequence_no INTEGER NOT NULL,
+  category    TEXT    NOT NULL,
+  title       TEXT    NOT NULL,
+  description TEXT    NOT NULL DEFAULT ''
+);
+`
+	if _, err := s.db.Exec(trackedSchema); err != nil {
+		return fmt.Errorf("store: migrate: %w", err)
+	}
 	return nil
 }
 

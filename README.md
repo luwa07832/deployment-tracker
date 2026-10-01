@@ -134,3 +134,122 @@ go run .
 `code` 使用小写下划线形式，`message` 不包含堆栈、文件路径或 SQL。
 
 当前使用的 `code`：`invalid_request`、`not_found`、`conflict`、`storage_unavailable`、`invalid_release_input`、`release_not_found`、`environment_not_found`、`release_conflict`、`comparison_conflict`。
+
+## 可追溯发布记录 API（/api/v1）
+
+第二套发布记录能力与基线接口并存，全部位于 `/api/v1` 前缀下。它不改变上面任何入口的请求、响应、状态码或排序；新记录写入独立的表，基线入口读不到它们，反之亦然。错误响应仍是 `{"error":{"code":...,"message":...}}` 这一形状。
+
+### 环境登记
+
+目标环境必须先登记，发布记录才能写入。
+
+- `POST /api/v1/environments`：请求体 `{"environment":"prod","display_name":"Production"}`，`display_name` 可选。首次登记返回 201；同一 `environment` 重复登记是幂等的，返回 200 与已有记录（不会覆盖显示名）。`environment` 缺失或为空白时返回 422 `ENVIRONMENT_VALIDATION_FAILED`。
+- `GET /api/v1/environments`：返回 `{"environments":[...]}`，按环境标识排序；每项含 `environment`、`display_name`、`registered_at`。
+- `GET /api/v1/environments/{environment}`：返回 `{"environment":{...}}`；不存在返回 404 `ENVIRONMENT_NOT_FOUND`。
+
+### `POST /api/v1/release-records`
+
+登记一条可追溯发布记录。请求体：
+
+```json
+{
+  "environment": "prod",
+  "version": "1.2.0",
+  "changes": [
+    {"sequence": 1, "category": "feature", "title": "add login", "description": "users can sign in"},
+    {"sequence": 2, "category": "fix", "title": "fix logout", "description": "logout clears the session"}
+  ],
+  "gate_status": "allowed",
+  "rollback_point": "snapshot:1.1.0@sha256:abcdef"
+}
+```
+
+- `environment`、`version`、`changes`、`gate_status`、`rollback_point` 均为必填；`changes` 为数组（允许空数组）。
+- 每个变更条目的 `category`、`title`、`description` 为必填非空字符串；`sequence` 为可选正整数。要么所有条目都带 `sequence`（且互不相同），要么全部省略——全省略时服务端按数组顺序从 1 编号。
+- `gate_status` 只接受 `allowed`、`blocked`、`pending`。
+- `rollback_point` 是公开入口中的稳定标识，服务端只原样保存，不推断、不读取或生成任何文件内容。
+- 成功返回 201 与 `{"release_record": {...}}`，记录包含：
+  - `id`：稳定记录标识，形如 `rel_` 加 32 个十六进制字符（不暴露数据库主键）；
+  - `recorded_at`：服务端生成的记录时间，UTC，`YYYY-MM-DDTHH:MM:SSZ`；
+  - 完整的 `environment`、`version`、`changes`、`gate_status`、`rollback_point`。
+- 写入成功后立即可由下面的查询入口与差异比对读取。
+
+错误码（错误体仍只有 `error` 一个顶层键）：
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| 目标环境未登记 | 404 | `ENVIRONMENT_NOT_FOUND` |
+| 同一环境同一版本重复提交 | 409 | `RELEASE_ALREADY_EXISTS` |
+| 必填字段缺失、类型不符、`sequence` 非法或重复、门禁枚举非法、回滚点为空白 | 422 | `RELEASE_VALIDATION_FAILED` |
+| 请求体不是合法 JSON | 400 | `invalid_request` |
+
+### `GET /api/v1/release-records`
+
+查询参数全部可选，按 AND 组合：
+
+| 参数 | 含义 |
+|---|---|
+| `environment` | 目标环境；未登记时 404 `ENVIRONMENT_NOT_FOUND` |
+| `version` | 精确版本 |
+| `gate_status` | 门禁状态；非枚举值返回 422 `RELEASE_VALIDATION_FAILED` |
+| `recorded_from` / `recorded_to` | 记录时间闭区间，支持 RFC3339 时刻或 `YYYY-MM-DD` 日期（日期分别取当日 00:00:00 / 23:59:59 UTC）；无法解析返回 422 `RELEASE_VALIDATION_FAILED` |
+
+返回 200 `{"release_records":[...]}`，按 `recorded_at` 倒序；同一时刻再按写入顺序倒序，保证结果确定。空结果为 `[]`。
+
+### `GET /api/v1/release-records/{id}`
+
+按稳定标识取得单条完整记录（含全部变更条目与回滚点）；不存在返回 404 `RELEASE_RECORD_NOT_FOUND`。
+
+### `GET /api/v1/compare?left=<env>&right=<env>[&version=<v> | &as_of=<time>]`
+
+比较两个已登记环境，读取语义与上面的查询入口完全一致。范围口径二选一：
+
+- 都不给：比较两侧全部可追溯记录；
+- `as_of=<time>`：截止时间口径（含），只比较 `recorded_at` 不晚于该时刻的记录；取值为 RFC3339 时刻或 `YYYY-MM-DD` 日期（日期取当日 23:59:59 UTC）。这是一个时间范围，范围为空（如过去的日期）是合法的 200 空结果；无法解析返回 400 `INVALID_COMPARE_RANGE`；
+- `version=<version>`：精确基线版本口径，只比较该版本；该版本在两侧都不存在时返回 400 `RELEASE_VERSION_NOT_FOUND`（只存在于一侧是合法的漂移场景，不报错）。
+
+成功返回 200：
+
+```json
+{
+  "left": "staging",
+  "right": "prod",
+  "as_of": "2026-09-30T23:59:59Z",
+  "compared_at": "2026-10-01T08:30:00Z",
+  "left_versions": ["1.0.0"],
+  "right_versions": ["1.0.0", "1.2.0"],
+  "common_versions": ["1.0.0"],
+  "only_left_versions": [],
+  "only_right_versions": ["1.2.0"],
+  "version_diffs": [
+    {
+      "version": "1.0.0",
+      "field_diffs": [
+        {"field": "rollback_point", "left": "snap:0.9.0", "right": "snap:0.8.0"}
+      ],
+      "gate_status": {"left": "allowed", "right": "blocked", "changed": true},
+      "added_changes": [{"sequence": 2, "category": "feature", "title": "c", "description": "..."}],
+      "removed_changes": [{"sequence": 2, "category": "fix", "title": "b", "description": "..."}],
+      "changed_changes": [
+        {"left": {"sequence": 1, "category": "feature", "title": "a", "description": "old"},
+         "right": {"sequence": 1, "category": "feature", "title": "a", "description": "new"}}
+      ]
+    }
+  ]
+}
+```
+
+- 方向固定为 left → right：`added_changes` 是右侧有、左侧无；`removed_changes` 相反；变更条目按 `title` 识别为同一条，序号、分类或描述不同进入 `changed_changes`。
+- `field_diffs` 列出共有版本上其它标量字段的差异（目前包含 `rollback_point`）。
+- 所有版本列表按点分段版本序排列，空结果是确定的空数组；`baseline_version` 仅在版本口径下出现，`as_of` 仅在截止时间口径下出现（无范围口径时二者均省略）；`compared_at` 为服务端比较时刻（UTC 秒精度），用于解释结果。除该时间戳外，同一输入的结果逐字节稳定。
+
+错误码：
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| `left` 与 `right` 相同 | 400 | `SAME_ENVIRONMENT_COMPARE` |
+| 缺少 `left`/`right`、同时给了 `version` 与 `as_of`，或 `as_of` 无法解析 | 400 | `INVALID_COMPARE_RANGE` |
+| 精确版本在两侧都不存在 | 400 | `RELEASE_VERSION_NOT_FOUND` |
+| 任一环境未登记 | 404 | `ENVIRONMENT_NOT_FOUND` |
+
+这些问题不会被静默折叠成空结果。
