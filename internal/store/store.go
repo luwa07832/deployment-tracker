@@ -11,10 +11,15 @@ import (
 
 // Error codes returned to clients. Every response that is not a success carries exactly one of these.
 const (
-	CodeInvalidRequest     = "invalid_request"
-	CodeNotFound           = "not_found"
-	CodeConflict           = "conflict"
-	CodeStorageUnavailable = "storage_unavailable"
+	CodeInvalidRequest      = "invalid_request"
+	CodeNotFound            = "not_found"
+	CodeConflict            = "conflict"
+	CodeStorageUnavailable  = "storage_unavailable"
+	CodeInvalidReleaseInput = "invalid_release_input"
+	CodeReleaseNotFound     = "release_not_found"
+	CodeEnvironmentNotFound = "environment_not_found"
+	CodeReleaseConflict     = "release_conflict"
+	CodeComparisonConflict  = "comparison_conflict"
 )
 
 // Error is the JSON shape of a failed request as described in README.md.
@@ -90,5 +95,45 @@ CREATE TABLE IF NOT EXISTS deployments (
 	if _, err := s.db.Exec(schema); err != nil {
 		return fmt.Errorf("store: migrate: %w", err)
 	}
+	// Columns added after the initial schema. Existing databases gain them one
+	// by one; rows written before this change keep NULL and stay readable.
+	additions := []struct{ column, statement string }{
+		{"changes_json", `ALTER TABLE deployments ADD COLUMN changes_json TEXT`},
+		{"gate_status", `ALTER TABLE deployments ADD COLUMN gate_status TEXT`},
+		{"rollback_point", `ALTER TABLE deployments ADD COLUMN rollback_point TEXT`},
+	}
+	for _, addition := range additions {
+		exists, err := s.columnExists("deployments", addition.column)
+		if err != nil {
+			return fmt.Errorf("store: migrate: %w", err)
+		}
+		if exists {
+			continue
+		}
+		if _, err := s.db.Exec(addition.statement); err != nil {
+			return fmt.Errorf("store: migrate: %w", err)
+		}
+	}
 	return nil
+}
+
+// columnExists reports whether the named column is present on the table.
+func (s *Store) columnExists(table, column string) (bool, error) {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, columnType string
+		var defaultValue sql.NullString
+		if err := rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &pk); err != nil {
+			return false, err
+		}
+		if name == column {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }

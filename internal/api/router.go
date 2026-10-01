@@ -22,6 +22,11 @@ func NewRouter(deps Dependencies) *gin.Engine {
 	engine.NoRoute(func(c *gin.Context) { fail(c, http.StatusNotFound, store.CodeNotFound, "no such endpoint") })
 
 	engine.GET("/healthz", healthz(deps))
+	engine.POST("/releases", createRelease(deps))
+	engine.GET("/releases", listReleases(deps))
+	engine.GET("/releases/:environment/:version", getRelease(deps))
+	engine.GET("/environments/:environment/history", getHistory(deps))
+	engine.GET("/compare", compareEnvironments(deps))
 	return engine
 }
 
