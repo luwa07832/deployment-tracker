@@ -19,6 +19,7 @@ type ChangeEntry struct {
 // ReleaseRecord is one traceable release record with structured change
 // entries and an opaque rollback point identifier.
 type ReleaseRecord struct {
+	ID            int64
 	PublicID      string
 	Environment   string
 	Version       string
@@ -125,7 +126,7 @@ func (s *Store) InsertReleaseRecord(record *ReleaseRecord) error {
 // (nil, nil) when it does not exist.
 func (s *Store) GetReleaseRecord(publicID string) (*ReleaseRecord, error) {
 	rows, err := s.queryReleaseRecords(
-		`SELECT r.`+strings.ReplaceAll(releaseRecordColumns, ", ", ", r.")+
+		`SELECT r.id, r.`+strings.ReplaceAll(releaseRecordColumns, ", ", ", r.")+
 			`, e.sequence_no, e.category, e.title, e.description
 		 FROM release_records r
 		 LEFT JOIN release_change_entries e ON e.record_id = r.id
@@ -172,7 +173,7 @@ func (s *Store) ListReleaseRecords(filter ReleaseRecordFilter) ([]ReleaseRecord,
 		where = append(where, `r.recorded_at <= ?`)
 		args = append(args, filter.To)
 	}
-	query := `SELECT r.` + strings.ReplaceAll(releaseRecordColumns, ", ", ", r.") +
+	query := `SELECT r.id, r.` + strings.ReplaceAll(releaseRecordColumns, ", ", ", r.") +
 		`, e.sequence_no, e.category, e.title, e.description
 		 FROM release_records r
 		 LEFT JOIN release_change_entries e ON e.record_id = r.id`
@@ -189,7 +190,7 @@ func (s *Store) ListReleaseRecords(filter ReleaseRecordFilter) ([]ReleaseRecord,
 // semantics the baseline API uses.
 func (s *Store) EffectiveReleaseRecord(environment, version string) (*ReleaseRecord, error) {
 	rows, err := s.queryReleaseRecords(
-		`SELECT r.`+strings.ReplaceAll(releaseRecordColumns, ", ", ", r.")+
+		`SELECT r.id, r.`+strings.ReplaceAll(releaseRecordColumns, ", ", ", r.")+
 			`, e.sequence_no, e.category, e.title, e.description
 		 FROM release_records r
 		 LEFT JOIN release_change_entries e ON e.record_id = r.id
@@ -204,6 +205,31 @@ func (s *Store) EffectiveReleaseRecord(environment, version string) (*ReleaseRec
 		return nil, nil
 	}
 	return &rows[0], nil
+}
+
+// ListReleaseRecordHistory returns one page of an environment's records in
+// the order history pages follow: recorded_at descending, then insertion id
+// descending. The keyset anchor (afterRecordedAt, afterID) marks the last row
+// already returned; zero values request the first page. Up to limit+1 rows are
+// fetched so the caller can detect a following page.
+func (s *Store) ListReleaseRecordHistory(environment string, afterRecordedAt string, afterID int64, limit int) ([]ReleaseRecord, error) {
+	query := `SELECT r.id, r.` + strings.ReplaceAll(releaseRecordColumns, ", ", ", r.") +
+		`, e.sequence_no, e.category, e.title, e.description
+		 FROM (
+		   SELECT id, recorded_at FROM release_records
+		   WHERE environment = ?`
+	args := []any{environment}
+	if afterID > 0 {
+		query += ` AND (recorded_at < ? OR (recorded_at = ? AND id < ?))`
+		args = append(args, afterRecordedAt, afterRecordedAt, afterID)
+	}
+	query += ` ORDER BY recorded_at DESC, id DESC LIMIT ?
+		 ) AS page
+		 JOIN release_records r ON r.id = page.id
+		 LEFT JOIN release_change_entries e ON e.record_id = r.id
+		 ORDER BY page.recorded_at DESC, page.id DESC, e.sequence_no ASC, e.id ASC`
+	args = append(args, limit+1)
+	return s.queryReleaseRecords(query, args...)
 }
 
 // queryReleaseRecords runs a joined query and assembles records with their
@@ -221,7 +247,7 @@ func (s *Store) queryReleaseRecords(query string, args ...any) ([]ReleaseRecord,
 		var sequence sql.NullInt64
 		var category, title, description sql.NullString
 		if err := rows.Scan(
-			&record.PublicID, &record.Environment, &record.Version, &record.BatchID, &record.GateStatus,
+			&record.ID, &record.PublicID, &record.Environment, &record.Version, &record.BatchID, &record.GateStatus,
 			&record.RollbackPoint, &record.RecordedAt,
 			&sequence, &category, &title, &description,
 		); err != nil {

@@ -23,6 +23,14 @@ const (
 	CodePromotionOrderConflictV1   = "PROMOTION_ORDER_CONFLICT"
 	CodeSamePromotionNodeV1        = "SAME_PROMOTION_NODE"
 	CodePromotionChangeNotFoundV1  = "PROMOTION_CHANGE_NOT_FOUND"
+
+	// Cross-environment release comparison with explicitly selected versions
+	// and per-environment release history.
+	CodeReleaseComparisonEnvironmentNotFound = "ReleaseComparisonEnvironmentNotFound"
+	CodeReleaseComparisonVersionNotFound     = "ReleaseComparisonVersionNotFound"
+	CodeReleaseComparisonDataIncomplete      = "ReleaseComparisonDataIncomplete"
+	CodeInvalidReleaseComparisonQuery        = "INVALID_RELEASE_COMPARISON_QUERY"
+	CodeInvalidHistoryPagination             = "INVALID_HISTORY_PAGINATION"
 )
 
 // TrackedEnvironment is an environment that may receive release records.

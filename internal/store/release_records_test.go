@@ -213,3 +213,89 @@ func TestEffectiveReleaseRecordReadsBack(t *testing.T) {
 		t.Fatalf("missing = %+v, %v", missing, err)
 	}
 }
+
+func TestListReleaseRecordHistoryKeysetPaging(t *testing.T) {
+	db := openTestStore(t)
+	other := &TrackedEnvironment{Environment: "other", DisplayName: ""}
+	if _, err := db.EnsureEnvironment(other); err != nil {
+		t.Fatal(err)
+	}
+	prod := &TrackedEnvironment{Environment: "prod", DisplayName: ""}
+	if _, err := db.EnsureEnvironment(prod); err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]int64, 0, 5)
+	for i := 0; i < 5; i++ {
+		recEntries := entries("c"+string(rune('0'+i)), "extra"+string(rune('0'+i)), "third"+string(rune('0'+i)))
+		rec := sampleRecord("prod", "1.0."+string(rune('0'+i)), "allowed", "0.9.0", recEntries...)
+		if err := db.InsertReleaseRecord(rec); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+		ids = append(ids, rec.ID)
+	}
+	// A record in another environment must never enter the page.
+	otherRec := sampleRecord("other", "9.9.9", "allowed", "0.9.0", entries("x")...)
+	if err := db.InsertReleaseRecord(otherRec); err != nil {
+		t.Fatal(err)
+	}
+	page1, err := db.ListReleaseRecordHistory("prod", "", 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page1) != 3 {
+		t.Fatalf("limit+1 fetch expected 3 rows, got %d", len(page1))
+	}
+	last := page1[1]
+	page2, err := db.ListReleaseRecordHistory("prod", last.RecordedAt, last.ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page2) != 3 {
+		t.Fatalf("second page expected 3 rows (2 + has-more), got %d", len(page2))
+	}
+	all := append(append([]ReleaseRecord{}, page1[:2]...), page2[:2]...)
+	if len(all) != 4 {
+		t.Fatalf("two pages of 2 must return 4 rows, got %d", len(all))
+	}
+	// Deterministic descending order over (recorded_at, id): every emitted id
+	// must be strictly later than the next one.
+	for i := 0; i+1 < len(all); i++ {
+		a, b := all[i], all[i+1]
+		if a.RecordedAt < b.RecordedAt || (a.RecordedAt == b.RecordedAt && a.ID <= b.ID) {
+			t.Fatalf("page order not descending at %d: %d@%s before %d@%s", i, a.ID, a.RecordedAt, b.ID, b.RecordedAt)
+		}
+	}
+	// Cursor at the final row yields only the has-more row and then nothing.
+	page3, err := db.ListReleaseRecordHistory("prod", page2[1].RecordedAt, page2[1].ID, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page3) != 1 {
+		t.Fatalf("final slice expected 1 row, got %d", len(page3))
+	}
+	if page3[0].ID != ids[0] {
+		t.Fatalf("oldest row id = %d, want %d", page3[0].ID, ids[0])
+	}
+}
+
+func TestListReleaseRecordHistoryKeepsAllEntriesPerRecord(t *testing.T) {
+	db := openTestStore(t)
+	env := &TrackedEnvironment{Environment: "prod"}
+	if _, err := db.EnsureEnvironment(env); err != nil {
+		t.Fatal(err)
+	}
+	rec := sampleRecord("prod", "1.0.0", "allowed", "1.0.0", entries("a", "b", "c")...)
+	if err := db.InsertReleaseRecord(rec); err != nil {
+		t.Fatal(err)
+	}
+	page, err := db.ListReleaseRecordHistory("prod", "", 0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 1 {
+		t.Fatalf("one record must fill a limit-1 page even with 3 entries, got %d", len(page))
+	}
+	if len(page[0].Changes) != 3 {
+		t.Fatalf("LIMIT must apply to records, not joined entry rows: got %d entries", len(page[0].Changes))
+	}
+}

@@ -255,6 +255,84 @@ go run .
 
 这些问题不会被静默折叠成空结果。
 
+### `GET /api/v1/release-comparison?left=<env>&left_version=<v>&right=<env>&right_version=<v>`
+
+跨环境差异比对：为两个目标环境各显式选择一个版本，系统按统一口径直接返回两条发布之间的差异。四个查询参数均必填；环境名与版本标识按已保存的**原值精确识别**，不做空白裁剪、模糊匹配或改写。`left` 与 `right` 允许相同（用于同一环境两个历史版本之间的比较）。
+
+成功返回 200：
+
+```json
+{
+  "left_environment": "dev",
+  "left_version": "2.0.0",
+  "right_environment": "prod",
+  "right_version": "2.1.0",
+  "left": {"id": "rel_…", "environment": "dev", "version": "2.0.0", "gate_status": "allowed", "rollback_point": "1.0.0", "recorded_at": "2026-10-01T08:00:00Z"},
+  "right": {"id": "rel_…", "environment": "prod", "version": "2.1.0", "gate_status": "blocked", "rollback_point": "1.0.0", "recorded_at": "2026-10-01T09:00:00Z"},
+  "version": {"left": "2.0.0", "right": "2.1.0", "changed": true},
+  "gate_status": {"left": "allowed", "right": "blocked", "changed": true},
+  "rollback_point": {
+    "left": "1.0.0",
+    "right": "1.0.0",
+    "changed": false,
+    "left_target": {"…": "回滚点标识在 left 环境中指向的发布记录（完整记录）"},
+    "right_target": {"…": "回滚点标识在 right 环境中指向的发布记录（完整记录）"},
+    "target_changed": false
+  },
+  "changes": [
+    {
+      "change_id": "alpha",
+      "summary": {"left": "dev alpha", "right": "prod alpha new"},
+      "present": {"left": true, "right": true},
+      "comparison": "changed",
+      "left": {"sequence": 1, "category": "feature", "title": "alpha", "description": "dev alpha"},
+      "right": {"sequence": 1, "category": "feature", "title": "alpha", "description": "prod alpha new"}
+    },
+    {
+      "change_id": "gamma",
+      "summary": {"right": "brand new"},
+      "present": {"left": false, "right": true},
+      "comparison": "added",
+      "right": {"sequence": 3, "category": "feature", "title": "gamma", "description": "brand new"}
+    }
+  ],
+  "change_summary": {"added": 1, "missing": 0, "changed": 1},
+  "consistent": false
+}
+```
+
+约定：
+
+- 方向固定为 left → right。`changes` 逐条给出差异，按稳定标识 `change_id`（即变更条目的 `title`）字典序排列，只包含有差异的条目：
+  - `added`：右侧有、左侧无（`present` 为 `{left:false,right:true}`）；
+  - `missing`：左侧有、右侧无（`present` 为 `{left:true,right:false}`）；
+  - `changed`：两侧都有但序号、分类或描述不同（完整两侧条目同时给出）。
+- `summary` 给出该条目在存在侧的摘要（取该侧 `description`）；`left`/`right` 只携带对应侧存在的条目。
+- 两侧内容完全一致时 `changes` 为确定的空数组 `[]`，`change_summary` 各项为 0，`consistent` 为 `true`。
+- `gate_status` 只按发布时记录的值比较，不依据任何当前状态重新推断。
+- `rollback_point` 做两层比较：先比较回滚点标识（保存的原值），再在**各自环境内**把标识解析为它所指向的发布记录，比较目标发布对象的版本、门禁事实和全部变更条目内容（环境名不参与，因为两侧本来就处于不同环境）；任一层不同即 `changed: true`，目标对象不同另由 `target_changed: true` 标明。该解析只在已登记发布记录中按版本精确匹配，不读取或推断回滚点指向的文件内容。目标发布记录不存在时为缺少必要发布数据（见下表）。
+- `version`、`gate_status`、`rollback_point` 以及任一变更差异存在时，`consistent` 为 `false`。
+- 响应不含服务端生成时刻，相同输入连续查询字段、条目顺序与结论逐字节一致。两侧 `left`/`right`、回滚目标以及变更条目都携带原始记录标识，可直接回溯到 `GET /api/v1/release-records/{id}`。
+
+错误码（错误体仍只有 `error` 一个顶层键）：
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| 缺少任一必填查询参数 | 400 | `INVALID_RELEASE_COMPARISON_QUERY` |
+| 任一环境未登记 | 404 | `ReleaseComparisonEnvironmentNotFound` |
+| 指定（环境, 版本）没有发布记录（含原值不匹配、空白或大小写差异） | 404 | `ReleaseComparisonVersionNotFound` |
+| 某次发布缺少比较所需的必要数据（如回滚点无法解析到已登记发布对象） | 422 | `ReleaseComparisonDataIncomplete` |
+
+### `GET /api/v1/environments/{environment}/release-history[?limit=<n>&cursor=<opaque>]`
+
+同一环境内的发布历史追溯：按发布时间由近到远（`recorded_at` 倒序），同一秒内按写入顺序倒序稳定排列。每条都保留该次发布的版本、完整变更条目、发布时门禁状态与回滚点，并携带记录标识与时间，可继续用 `GET /api/v1/release-records/{id}` 回溯。
+
+- `limit` 可选：1–100 的整数，默认 20；越界或非整数返回 400 `INVALID_HISTORY_PAGINATION`。
+- `cursor` 可选：上一页响应中的 `next_cursor`，不透明字符串；非法或被篡改返回 400 `INVALID_HISTORY_PAGINATION`。
+- 分页采用键集（keyset）游标，翻页只读取游标之后的记录：翻页期间的新写入不会造成记录重复或遗漏，相同顺序下结果可重复。
+- 还有后续记录时 `next_cursor` 为非空字符串；最后一页为空字符串 `""`。无记录时 `releases` 为确定的空数组 `[]`。
+- 环境未登记返回 404 `ReleaseComparisonEnvironmentNotFound`；分页参数校验先于环境存在性检查。
+
 ## 发布批次与晋级链路 API（/api/v1）
 
 发布记录可以携带可选的 `batch_id`，用于把同一发布批次在多个环境中的发布事实关联成一条晋级链路。它只是发布记录上的稳定标识：不改变写入、单记录查询和环境差异比对的既有语义。
