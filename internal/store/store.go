@@ -160,6 +160,22 @@ CREATE TABLE IF NOT EXISTS release_batch_routes (
   batch_id TEXT    PRIMARY KEY,
   route_id INTEGER NOT NULL REFERENCES promotion_routes(id)
 );
+CREATE TABLE IF NOT EXISTS release_gate_evaluations (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_id   INTEGER NOT NULL UNIQUE REFERENCES release_records(id),
+  gate_status TEXT    NOT NULL,
+  created_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE TABLE IF NOT EXISTS release_gate_checks (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  evaluation_id INTEGER NOT NULL REFERENCES release_gate_evaluations(id),
+  position      INTEGER NOT NULL,
+  check_name    TEXT    NOT NULL,
+  status        TEXT    NOT NULL,
+  evidence      TEXT    NOT NULL,
+  waiver_reason TEXT    NOT NULL DEFAULT '',
+  UNIQUE (evaluation_id, check_name)
+);
 `
 	if _, err := s.db.Exec(trackedSchema); err != nil {
 		return fmt.Errorf("store: migrate: %w", err)

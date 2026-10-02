@@ -213,6 +213,82 @@ go run .
 
 按稳定标识取得单条完整记录（含全部变更条目与回滚点）；不存在返回 404 `RELEASE_RECORD_NOT_FOUND`。
 
+### `POST /api/v1/release-records/{id}/gate-evaluations`
+
+为已保存的发布事实登记一份**不可变**公开门禁检查快照，让该 release record 的 `gate_status` 可由明细解释。快照一旦建立即不可改写；不改写旧版入口，也不影响 release record 既有字段与语义。请求体：
+
+```json
+{
+  "checks": [
+    {"check_name": "unit-tests", "status": "passed", "evidence": "ci:job/42"},
+    {"check_name": "canary", "status": "waived", "evidence": "ticket:GATE-7", "waiver_reason": "known flake, risk accepted"},
+    {"check_name": "smoke", "status": "pending", "evidence": "ci:job/43"}
+  ]
+}
+```
+
+- `checks` 必填且为非空数组；每个 check 的 `check_name` 为必填非空白字符串，同一份快照内必须唯一；`evidence` 为必填非空白字符串，服务端只原样保存。
+- `status` 仅接受 `passed`、`failed`、`waived`、`pending`。
+- `waiver_reason` 仅在 `status` 为 `waived` 时必填（非空白）；其余状态必须省略该字段，给出（即使为空白）都按校验失败处理。
+- 有效门禁状态按 checks 推导：存在任一 `failed` → `blocked`；否则存在任一 `pending` → `pending`；全部为 `passed`/`waived` → `allowed`。推导结果必须与 release record 已保存的 `gate_status` 相等，否则拒绝登记。
+- 原子落库：快照主记录与全部 checks 在同一个事务内写入，任何一步失败整体回滚。
+- 对同一 release record 以**相同内容**（允许 check 顺序不同，按 `check_name` 归一比较）重复提交时返回 HTTP 200 与原始快照；提交不同内容返回 409 `GATE_EVALUATION_CONFLICT`，既有快照保持不变。首次成功建立同样返回 200。
+
+成功响应外层为 `{"gate_evaluation": {...}}`，快照包含发布定位与门禁事实：
+
+- `release`：所属 release record 的稳定标识（即路径中的 `id`）；
+- `environment`、`version`：发布定位；写入时携带 `batch_id` 的记录还包含该字段；
+- `gate_status`：release record 已保存的门禁状态；
+- `effective_gate_status`：由 checks 推导的有效门禁状态，与 `gate_status` 相等；
+- `checks`：按 `check_name` 字典序排序；每个 check 输出 `check_name`、`status`、`evidence`，仅 `waived` 的 check 包含 `waiver_reason`。
+
+错误码（错误体仍只有 `error` 一个顶层键）：
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| 路径指向的 release record 不存在 | 404 | `RELEASE_RECORD_NOT_FOUND` |
+| 请求体不是合法 JSON | 400 | `invalid_request` |
+| `checks` 缺失或为空、`check_name` 空白或重复、`status` 非枚举、`evidence` 空白、`waiver_reason` 规则不符、字段类型不符 | 422 | `GATE_EVALUATION_VALIDATION_FAILED` |
+| checks 推导出的状态与 release record 的 `gate_status` 不一致 | 409 | `GATE_STATUS_MISMATCH` |
+| 该 release record 已存在不同内容的快照 | 409 | `GATE_EVALUATION_CONFLICT` |
+| 快照或 checks 落库失败 | 503 | `storage_unavailable` |
+
+推导状态与原 `gate_status` 的一致性检查先于重复内容判定，因此重复提交一份推导结果不同的 checks 时返回 `GATE_STATUS_MISMATCH`。
+
+### `GET /api/v1/release-records/{id}/gate-evaluations`
+
+读取某条 release record 的门禁快照。返回形状与 POST 成功响应一致：外层 `{"gate_evaluation": {...}}`，含发布定位（`release`、`environment`、`version`，有批次时含 `batch_id`）、`gate_status`、`effective_gate_status` 以及按 `check_name` 排序的 `checks`。
+
+- release record 存在但尚无快照、或 release record 不存在，统一返回 404 `GATE_EVALUATION_NOT_FOUND`。
+- 存储不可用返回 503 `storage_unavailable`。
+
+### `GET /api/v1/gate-evaluations`
+
+跨发布读取门禁快照。查询参数全部可选，按 AND 组合；无命中返回确定的空数组 `[]`：
+
+| 参数 | 含义 |
+|---|---|
+| `environment` | 发布环境精确匹配；未登记时 404 `ENVIRONMENT_NOT_FOUND` |
+| `version` | 发布版本精确匹配 |
+| `gate_status` | 快照门禁状态；仅接受 `allowed`、`blocked`、`pending` |
+| `check_status` | 至少包含一个该状态 check 的快照；仅接受 `passed`、`failed`、`waived`、`pending` |
+| `limit` | 每页条数，省略时为 20；显式空白、非整数、小于 1 或大于 100 返回 400 `INVALID_GATE_EVALUATION_QUERY` |
+| `cursor` | 上一页返回的不透明签名分页游标；显式空白、截断、篡改（含签名不符）或与首次请求筛选快照不一致返回 400 `INVALID_GATE_EVALUATION_QUERY` |
+
+返回 200，外层只有 `gate_evaluations` 与 `next_cursor` 两个键。结果按快照建立顺序从新到旧倒序排列（键集分页，游标不透明且不暴露数据库主键）；每个快照内 `checks` 仍按 `check_name` 排序。有更多记录时 `next_cursor` 为不透明值，末页或无命中时为空字符串 `""`。游标与四个筛选参数的规范化值绑定，`limit` 不绑定；校验顺序为分页与筛选形状校验在前、环境登记检查在后。
+
+错误码（单错误 JSON 形状）：
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| `limit`/`cursor` 非法、参数显式空白、`gate_status` 或 `check_status` 非枚举值 | 400 | `INVALID_GATE_EVALUATION_QUERY` |
+| `environment` 未登记 | 404 | `ENVIRONMENT_NOT_FOUND` |
+| 存储不可用 | 503 | `storage_unavailable` |
+
+该入口为只读；它不登记环境、不改写发布事实，也不影响 release-records、change-entries、compare 等任何既有入口。
+
+
+
 ### `GET /api/v1/change-entries`
 
 跨发布检索结构化变更条目。结果只包含 `POST /api/v1/release-records` 写入的结构化 `changes`；旧版 `POST /releases` 的字符串变更不进入结果。查询参数全部可选，前六项提供时按 AND 精确匹配、省略时不筛：
