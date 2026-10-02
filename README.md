@@ -206,6 +206,60 @@ go run .
 
 按稳定标识取得单条完整记录（含全部变更条目与回滚点）；不存在返回 404 `RELEASE_RECORD_NOT_FOUND`。
 
+### `GET /api/v1/change-entries`
+
+跨发布检索结构化变更条目。该入口**只**读取 `POST /api/v1/release-records` 落库的结构化 `changes`；旧版 `POST /releases` 写入的字符串变更保存在独立表中，永不进入结果。查询参数全部可选：
+
+| 参数 | 含义 |
+|---|---|
+| `environment` | 所属发布的目标环境，精确匹配；提供时未登记返回 404 `ENVIRONMENT_NOT_FOUND` |
+| `version` | 所属发布的版本，精确匹配 |
+| `batch_id` | 所属发布的批次标识，精确匹配；省略时不限批次（含无批次记录） |
+| `category` | 变更条目分类，精确匹配 |
+| `title` | 变更条目标题，精确匹配 |
+| `gate_status` | 所属发布的门禁状态；只接受 `allowed`、`blocked`、`pending` |
+| `from` / `to` | 所属发布 `recorded_at` 的 UTC 秒级闭区间，格式严格为 `YYYY-MM-DDTHH:MM:SSZ`，分别可省略 |
+| `limit` | 每页条目数，默认 20，仅接受 1–100 的整数 |
+| `cursor` | 上一页返回的不透明分页标记 |
+
+前六项在提供时按 AND 组合，省略时不参与筛选；空白（含纯空白字符）参数一律视为非法。`from` 晚于 `to` 非法。返回 200，外层只包含两个键：
+
+```json
+{
+  "changes": [
+    {
+      "sequence": 1,
+      "category": "feature",
+      "title": "add login",
+      "description": "users can sign in",
+      "id": "rel_…",
+      "environment": "prod",
+      "version": "1.2.0",
+      "batch_id": "b-2026-10-01",
+      "gate_status": "allowed",
+      "rollback_point": "snapshot:1.1.0@sha256:abcdef",
+      "recorded_at": "2026-10-01T08:00:00Z"
+    }
+  ],
+  "next_cursor": ""
+}
+```
+
+- 每项含条目自身的 `sequence`、`category`、`title`、`description`，以及所属发布的 `id`、`environment`、`version`、`batch_id`（无批次时省略该键）、`gate_status`、`rollback_point`、`recorded_at`。
+- 排序：先按所属发布的 `recorded_at` 降序，同一时刻跨发布按写入顺序（内部插入序）降序；同一发布内按 `sequence` 升序，再按 `title` 升序。
+- 游标分页：取到 `limit` 条且仍有后续时 `next_cursor` 为不透明标记；末页（含无命中）为空字符串 `""`。无命中时 `changes` 为确定的空数组 `[]`。
+- `cursor` 绑定签发它时的全部筛选条件（`limit` 除外，可在翻页时调整）：条件不一致、标记截断或无法解析都返回 400。首请求时已存在的条目在跨页过程中不会重复或遗漏；分页期间并发写入的新记录只影响后续首屏，不改变既有条目的相对顺序。
+
+错误（错误体仍只有 `error` 一个顶层键）：
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| 参数空白、`limit` 越界或非整数、时间格式非法、`from` 晚于 `to`、`gate_status` 非枚举值、`cursor` 截断/篡改/与筛选条件不一致 | 400 | `INVALID_CHANGE_QUERY` |
+| `environment` 已提供但未登记（非法查询参数优先于该检查） | 404 | `ENVIRONMENT_NOT_FOUND` |
+| 存储不可用 | 503 | `storage_unavailable` |
+
+该入口只读不写，不影响 `release-records` 的写入、重复登记与冲突语义，也不改变其他任何入口的结果、状态码与错误码。
+
 ### `GET /api/v1/compare?left=<env>&right=<env>[&version=<v> | &as_of=<time>]`
 
 比较两个已登记环境，读取语义与上面的查询入口完全一致。范围口径二选一：
