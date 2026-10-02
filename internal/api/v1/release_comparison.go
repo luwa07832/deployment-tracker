@@ -217,20 +217,15 @@ func buildReleaseComparison(left, right, leftTarget, rightTarget *store.ReleaseR
 
 // sameReleaseObject compares the release object a rollback point points to:
 // its version, the gate status recorded for it and the full content of its
-// change entries (keyed by the stable title). The environment is not part of
+// change entries (matched by stable title and paired positionally by
+// ascending sequence when a title repeats). The environment is not part of
 // the comparison because each side lives in its own environment.
 func sameReleaseObject(a, b *store.ReleaseRecord) bool {
 	if a.Version != b.Version || a.GateStatus != b.GateStatus {
 		return false
 	}
-	aEntries := indexEntries(a.Changes)
-	bEntries := indexEntries(b.Changes)
-	if len(aEntries) != len(bEntries) {
-		return false
-	}
-	for title, entry := range aEntries {
-		other, present := bEntries[title]
-		if !present || !sameEntry(entry, other) {
+	for _, pair := range matchChangeEntries(a.Changes, b.Changes) {
+		if pair.Left == nil || pair.Right == nil || !sameEntry(*pair.Left, *pair.Right) {
 			return false
 		}
 	}
@@ -242,30 +237,36 @@ func sameReleaseObject(a, b *store.ReleaseRecord) bool {
 // left, changed entries share a title but differ in sequence, category or
 // description. The output is sorted by the stable title identifier.
 func diffComparisonChanges(leftEntries, rightEntries []store.ChangeEntry) ([]releaseChangeDiffView, releaseChangeTotalsView) {
-	leftIndex := indexEntries(leftEntries)
-	rightIndex := indexEntries(rightEntries)
 	diffs := []releaseChangeDiffView{}
 	totals := releaseChangeTotalsView{}
-	for title, rightEntry := range rightIndex {
-		leftEntry, present := leftIndex[title]
-		if !present {
-			entry := changeEntryView(rightEntry)
+	for _, pair := range matchChangeEntries(leftEntries, rightEntries) {
+		switch {
+		case pair.Left == nil:
+			entry := changeEntryView(*pair.Right)
 			diffs = append(diffs, releaseChangeDiffView{
-				ChangeID:   title,
-				Summary:    changeSummaryView{Right: rightEntry.Description},
+				ChangeID:   pair.Title,
+				Summary:    changeSummaryView{Right: pair.Right.Description},
 				Present:    changePresenceView{Left: false, Right: true},
 				Comparison: "added",
 				Right:      &entry,
 			})
 			totals.Added++
-			continue
-		}
-		if !sameEntry(leftEntry, rightEntry) {
-			leftView := changeEntryView(leftEntry)
-			rightView := changeEntryView(rightEntry)
+		case pair.Right == nil:
+			entry := changeEntryView(*pair.Left)
 			diffs = append(diffs, releaseChangeDiffView{
-				ChangeID:   title,
-				Summary:    changeSummaryView{Left: leftEntry.Description, Right: rightEntry.Description},
+				ChangeID:   pair.Title,
+				Summary:    changeSummaryView{Left: pair.Left.Description},
+				Present:    changePresenceView{Left: true, Right: false},
+				Comparison: "missing",
+				Left:       &entry,
+			})
+			totals.Missing++
+		case !sameEntry(*pair.Left, *pair.Right):
+			leftView := changeEntryView(*pair.Left)
+			rightView := changeEntryView(*pair.Right)
+			diffs = append(diffs, releaseChangeDiffView{
+				ChangeID:   pair.Title,
+				Summary:    changeSummaryView{Left: pair.Left.Description, Right: pair.Right.Description},
 				Present:    changePresenceView{Left: true, Right: true},
 				Comparison: "changed",
 				Left:       &leftView,
@@ -274,21 +275,22 @@ func diffComparisonChanges(leftEntries, rightEntries []store.ChangeEntry) ([]rel
 			totals.Changed++
 		}
 	}
-	for title, leftEntry := range leftIndex {
-		if _, present := rightIndex[title]; !present {
-			entry := changeEntryView(leftEntry)
-			diffs = append(diffs, releaseChangeDiffView{
-				ChangeID:   title,
-				Summary:    changeSummaryView{Left: leftEntry.Description},
-				Present:    changePresenceView{Left: true, Right: false},
-				Comparison: "missing",
-				Left:       &entry,
-			})
-			totals.Missing++
+	sort.SliceStable(diffs, func(i, j int) bool {
+		if diffs[i].ChangeID != diffs[j].ChangeID {
+			return diffs[i].ChangeID < diffs[j].ChangeID
 		}
-	}
-	sort.Slice(diffs, func(i, j int) bool { return diffs[i].ChangeID < diffs[j].ChangeID })
+		return comparisonEntryOrder(diffs[i]) < comparisonEntryOrder(diffs[j])
+	})
 	return diffs, totals
+}
+
+// comparisonEntryOrder is the secondary sort key within one repeated title:
+// the carried entry on the present side, left preferred to match pairing.
+func comparisonEntryOrder(diff releaseChangeDiffView) string {
+	if diff.Left != nil {
+		return changedEntryOrder(*diff.Left)
+	}
+	return changedEntryOrder(*diff.Right)
 }
 
 // historyCursor is the opaque keyset marker returned to clients. It carries

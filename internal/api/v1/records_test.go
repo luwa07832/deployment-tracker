@@ -61,6 +61,38 @@ func TestCreateRecordEnvironmentNotFound(t *testing.T) {
 		http.StatusNotFound, store.CodeEnvironmentNotFoundV1)
 }
 
+func TestCreateRecordRejectsDuplicateChangeTitles(t *testing.T) {
+	router := newTestRouter(t)
+	registerEnvironmentOK(t, router, "prod")
+	duplicateBody := `{"environment":"prod","version":"1.0.0","changes":[
+		{"sequence":1,"category":"feature","title":"dup","description":"first"},
+		{"sequence":2,"category":"fix","title":"  dup  ","description":"second"},
+		{"sequence":3,"category":"fix","title":"other","description":"third"}],
+		"gate_status":"allowed","rollback_point":"0.9.0"}`
+	recorder := doRequest(t, router, http.MethodPost, "/api/v1/release-records", duplicateBody)
+	wantError(t, recorder, http.StatusUnprocessableEntity, store.CodeReleaseValidationV1)
+	if !strings.Contains(recorder.Body.String(), "title") {
+		t.Fatalf("validation message must name the title problem: %s", recorder.Body.String())
+	}
+
+	// Nothing was written: no main record and no change entries survive.
+	listRecorder := doRequest(t, router, http.MethodGet,
+		"/api/v1/release-records?environment=prod&version=1.0.0", "")
+	if list := decodeBody(t, listRecorder)["release_records"].([]any); len(list) != 0 {
+		t.Fatalf("rejected submission must leave no records: %v", list)
+	}
+	entriesRecorder := doRequest(t, router, http.MethodGet,
+		"/api/v1/change-entries?environment=prod&title=dup", "")
+	if entries := decodeBody(t, entriesRecorder)["changes"].([]any); len(entries) != 0 {
+		t.Fatalf("rejected submission must leave no change entries: %v", entries)
+	}
+
+	// After a rejected duplicate the (environment, version) slot stays free.
+	createRecordOK(t, router, `{"environment":"prod","version":"1.0.0","changes":[
+		{"sequence":1,"category":"feature","title":"dup","description":"only one"}],
+		"gate_status":"allowed","rollback_point":"0.9.0"}`)
+}
+
 func TestCreateRecordDuplicateConflict(t *testing.T) {
 	router := newTestRouter(t)
 	registerEnvironmentOK(t, router, "prod")

@@ -2,8 +2,6 @@ package v1
 
 import (
 	"net/http"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -215,64 +213,27 @@ func diffVersion(version string, left, right *store.ReleaseRecord) versionDiffVi
 			Right: right.RollbackPoint,
 		})
 	}
-	leftEntries := indexEntries(left.Changes)
-	rightEntries := indexEntries(right.Changes)
-	for title, rightEntry := range rightEntries {
-		leftEntry, present := leftEntries[title]
-		if !present {
-			view.AddedChanges = append(view.AddedChanges, toChangeEntryView(rightEntry))
-			continue
-		}
-		if !sameEntry(leftEntry, rightEntry) {
+	for _, pair := range matchChangeEntries(left.Changes, right.Changes) {
+		switch {
+		case pair.Left == nil:
+			view.AddedChanges = append(view.AddedChanges, toChangeEntryView(*pair.Right))
+		case pair.Right == nil:
+			view.RemovedChanges = append(view.RemovedChanges, toChangeEntryView(*pair.Left))
+		case !sameEntry(*pair.Left, *pair.Right):
 			view.ChangedChanges = append(view.ChangedChanges, changedEntryView{
-				Left:  toChangeEntryView(leftEntry),
-				Right: toChangeEntryView(rightEntry),
+				Left:  toChangeEntryView(*pair.Left),
+				Right: toChangeEntryView(*pair.Right),
 			})
 		}
 	}
-	for title, leftEntry := range leftEntries {
-		if _, present := rightEntries[title]; !present {
-			view.RemovedChanges = append(view.RemovedChanges, toChangeEntryView(leftEntry))
-		}
-	}
-	sortEntries(view.AddedChanges)
-	sortEntries(view.RemovedChanges)
-	sort.Slice(view.ChangedChanges, func(i, j int) bool {
-		return entryOrder(view.ChangedChanges[i].Left) < entryOrder(view.ChangedChanges[j].Left)
-	})
+	sortChangeViewsByTitle(view.AddedChanges)
+	sortChangeViewsByTitle(view.RemovedChanges)
+	sortChangedEntryViews(view.ChangedChanges)
 	return view
-}
-
-func indexEntries(entries []store.ChangeEntry) map[string]store.ChangeEntry {
-	indexed := make(map[string]store.ChangeEntry, len(entries))
-	for _, entry := range entries {
-		indexed[entry.Title] = entry
-	}
-	return indexed
 }
 
 func toChangeEntryView(entry store.ChangeEntry) changeEntryView {
 	return changeEntryView(entry)
-}
-
-func sameEntry(a, b store.ChangeEntry) bool {
-	return a.Sequence == b.Sequence && a.Category == b.Category && a.Description == b.Description
-}
-
-func sortEntries(entries []changeEntryView) {
-	sort.Slice(entries, func(i, j int) bool {
-		return entryOrder(entries[i]) < entryOrder(entries[j])
-	})
-}
-
-func entryOrder(entry changeEntryView) string {
-	return padSequence(entry.Sequence) + "\x00" + entry.Title
-}
-
-// padSequence makes sequence ordering lexical regardless of digit count.
-func padSequence(sequence int) string {
-	digits := strconv.Itoa(sequence)
-	return strings.Repeat("0", 12-len(digits)) + digits
 }
 
 func versionKeys(records map[string]*store.ReleaseRecord) []string {

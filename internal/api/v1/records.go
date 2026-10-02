@@ -175,6 +175,7 @@ func validateRecordInput(input *createRecordInput) (*store.ReleaseRecord, string
 	entries := make([]store.ChangeEntry, 0, len(rawEntries))
 	explicit := false
 	seenSequences := map[int]bool{}
+	seenTitles := map[string]bool{}
 	for i, raw := range rawEntries {
 		if raw.Category == nil || strings.TrimSpace(*raw.Category) == "" {
 			return nil, "changes[" + strconv.Itoa(i) + "].category is required"
@@ -197,10 +198,15 @@ func validateRecordInput(input *createRecordInput) (*store.ReleaseRecord, string
 			seenSequences[*raw.Sequence] = true
 			sequence = *raw.Sequence
 		}
+		title := strings.TrimSpace(*raw.Title)
+		if seenTitles[title] {
+			return nil, "changes[" + strconv.Itoa(i) + "].title duplicates an earlier change entry title"
+		}
+		seenTitles[title] = true
 		entries = append(entries, store.ChangeEntry{
 			Sequence:    sequence,
 			Category:    strings.TrimSpace(*raw.Category),
-			Title:       strings.TrimSpace(*raw.Title),
+			Title:       title,
 			Description: strings.TrimSpace(*raw.Description),
 		})
 	}

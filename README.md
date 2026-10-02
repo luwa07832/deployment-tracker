@@ -165,7 +165,7 @@ go run .
 ```
 
 - `environment`、`version`、`changes`、`gate_status`、`rollback_point` 均为必填；`changes` 为数组（允许空数组）。`batch_id` 为可选：非空白字符串，最长 200 个字符，用于发布晋级链路（见下文）；空白但非省略时按校验失败处理。
-- 每个变更条目的 `category`、`title`、`description` 为必填非空字符串；`sequence` 为可选正整数。要么所有条目都带 `sequence`（且互不相同），要么全部省略——全省略时服务端按数组顺序从 1 编号。
+- 每个变更条目的 `category`、`title`、`description` 为必填非空字符串（`title` 按去除首尾空白后的值识别）；`sequence` 为可选正整数。要么所有条目都带 `sequence`（且互不相同），要么全部省略——全省略时服务端按数组顺序从 1 编号。同一份 `changes` 中 `title` 去除首尾空白后只允许出现一次；重复时整体拒绝，不写入主记录或任何变更条目（见错误码表）。
 - `gate_status` 只接受 `allowed`、`blocked`、`pending`。
 - `rollback_point` 是公开入口中的稳定标识，服务端只原样保存，不推断、不读取或生成任何文件内容。
 - 成功返回 201 与 `{"release_record": {...}}`，记录包含：
@@ -180,7 +180,7 @@ go run .
 |---|---|---|
 | 目标环境未登记 | 404 | `ENVIRONMENT_NOT_FOUND` |
 | 同一环境同一版本重复提交 | 409 | `RELEASE_ALREADY_EXISTS` |
-| 必填字段缺失、类型不符、`sequence` 非法或重复、门禁枚举非法、回滚点为空白、`batch_id` 为空白或超长 | 422 | `RELEASE_VALIDATION_FAILED` |
+| 必填字段缺失、类型不符、`sequence` 非法或重复、同一份 `changes` 中 `title` 重复、门禁枚举非法、回滚点为空白、`batch_id` 为空白或超长 | 422 | `RELEASE_VALIDATION_FAILED` |
 | 请求体不是合法 JSON | 400 | `invalid_request` |
 | 保存主记录或变更条目时存储失败 | 503 | `storage_unavailable` |
 
@@ -362,7 +362,7 @@ go run .
 }
 ```
 
-- 方向固定为 left → right：`added_changes` 是右侧有、左侧无；`removed_changes` 相反；变更条目按 `title` 识别为同一条，序号、分类或描述不同进入 `changed_changes`。
+- 方向固定为 left → right：`added_changes` 是右侧有、左侧无；`removed_changes` 相反；变更条目按 `title` 识别为同一条，序号、分类或描述不同进入 `changed_changes`。同一 `title` 出现多次时（仅可能来自唯一约束生效前保存的历史记录），先按 `title` 分组、组内按 `sequence` 从小到大逐条配对，多出的条目逐条计为 `added_changes`/`removed_changes`；各类别输出统一按 `title` 排序，`title` 相同时按 `sequence` 排序，重复查询结果稳定。
 - `field_diffs` 列出共有版本上其它标量字段的差异（目前包含 `rollback_point`）。
 - 所有版本列表按点分段版本序排列，空结果是确定的空数组；`baseline_version` 仅在版本口径下出现，`as_of` 仅在截止时间口径下出现（无范围口径时二者均省略）；`compared_at` 为服务端比较时刻（UTC 秒精度），用于解释结果。除该时间戳外，同一输入的结果逐字节稳定。
 
@@ -425,14 +425,14 @@ go run .
 
 约定：
 
-- 方向固定为 left → right。`changes` 逐条给出差异，按稳定标识 `change_id`（即变更条目的 `title`）字典序排列，只包含有差异的条目：
+- 方向固定为 left → right。`changes` 逐条给出差异，按稳定标识 `change_id`（即变更条目的 `title`）字典序、同 `title` 再按 `sequence` 排列，只包含有差异的条目。同一 `title` 在任一侧重复时（唯一约束生效前保存的历史记录），按 `title` 分组后组内按 `sequence` 从小到大逐条配对，多出的条目逐条计为 `added`/`missing`，字段不同逐条计为 `changed`，每一条都参与 `change_summary` 与 `consistent`，不会只保留最后一条：
   - `added`：右侧有、左侧无（`present` 为 `{left:false,right:true}`）；
   - `missing`：左侧有、右侧无（`present` 为 `{left:true,right:false}`）；
   - `changed`：两侧都有但序号、分类或描述不同（完整两侧条目同时给出）。
 - `summary` 给出该条目在存在侧的摘要（取该侧 `description`）；`left`/`right` 只携带对应侧存在的条目。
 - 两侧内容完全一致时 `changes` 为确定的空数组 `[]`，`change_summary` 各项为 0，`consistent` 为 `true`。
 - `gate_status` 只按发布时记录的值比较，不依据任何当前状态重新推断。
-- `rollback_point` 做两层比较：先比较回滚点标识（保存的原值），再在**各自环境内**把标识解析为它所指向的发布记录，比较目标发布对象的版本、门禁事实和全部变更条目内容（环境名不参与，因为两侧本来就处于不同环境）；任一层不同即 `changed: true`，目标对象不同另由 `target_changed: true` 标明。该解析只在已登记发布记录中按版本精确匹配，不读取或推断回滚点指向的文件内容。目标发布记录不存在时为缺少必要发布数据（见下表）。
+- `rollback_point` 做两层比较：先比较回滚点标识（保存的原值），再在**各自环境内**把标识解析为它所指向的发布记录，比较目标发布对象的版本、门禁事实和全部变更条目内容（环境名不参与，因为两侧本来就处于不同环境）；变更条目采用与上面相同的按 `title` 分组、按 `sequence` 配对的完整条目口径，重复 `title` 不会因互相覆盖而误判目标相等。任一层不同即 `changed: true`，目标对象不同另由 `target_changed: true` 标明。该解析只在已登记发布记录中按版本精确匹配，不读取或推断回滚点指向的文件内容。目标发布记录不存在时为缺少必要发布数据（见下表）。
 - `version`、`gate_status`、`rollback_point` 以及任一变更差异存在时，`consistent` 为 `false`。
 - 响应不含服务端生成时刻，相同输入连续查询字段、条目顺序与结论逐字节一致。两侧 `left`/`right`、回滚目标以及变更条目都携带原始记录标识，可直接回溯到 `GET /api/v1/release-records/{id}`。
 
@@ -506,7 +506,7 @@ go run .
 
 约定：
 
-- `rollback_impact` 方向固定为 current → target，比较口径与 release-comparison 一致：`version`、`gate_status`、`rollback_point`（标识原值及其解析到的目标发布对象两层）以及以 `title` 标识的变更条目（`added`：目标有、current 无；`missing`：current 有、目标无；`changed`：两侧都有但序号、分类或描述不同）。
+- `rollback_impact` 方向固定为 current → target，比较口径与 release-comparison 一致：`version`、`gate_status`、`rollback_point`（标识原值及其解析到的目标发布对象两层）以及以 `title` 标识的变更条目（`added`：目标有、current 无；`missing`：current 有、目标无；`changed`：两侧都有但序号、分类或描述不同）。重复 `title`（历史数据）同样按 `title` 分组、组内按 `sequence` 从小到大逐条配对，多出条目逐条计入 `added`/`missing` 并累加进 `change_summary`，无差异时仍为确定空数组、零计数和 `consistent: true`。
 - 目标就是 current 自身时差异为确定空结果：`changes` 为 `[]`、`change_summary` 全 0、各 `changed` 为 false、`consistent` 为 true。
 - 目标缺失（`missing`）时差异只承载 current 侧事实：标量 `right` 省略、变更全部计为 `missing`、`consistent` 为 false。
 - 响应不含除 `as_of` 外的服务端生成时刻；显式给出 `as_of` 且数据不变时，连续查询的字段、顺序与结论逐字节稳定。本端点只读，不写入任何发布事实。
@@ -639,7 +639,7 @@ go run .
 - `nodes` 顺序就是请求的环境顺序；同一节点在批次内有多次发布时，`releases` 按发布时间从旧到新**完整列出**，绝不只保留最后一次；同一秒写入的多次发布按写入顺序稳定排列。
 - `effective_release` 是该节点登记顺序最后的发布事实，逐段差异基于相邻节点的有效事实计算。
 - `segment_diffs` 只包含存在确定差异的相邻段，按链路顺序排列；无任何差异时为确定的空数组 `[]`，此时 `consistent` 为 `true`。只要任一段存在变更条目的新增、缺失、不一致，或版本分歧、门禁事实冲突、回滚点不一致，`consistent` 即为 `false`，并分别给出确定的差异类别，不合并成笼统结果。
-- 变更条目以稳定标识 `title` 识别（与既有环境差异比对一致）；差异中的变更列表按 `title` 字典序排列；节点发布事实中的变更保留记录里的原始顺序。
+- 变更条目以稳定标识 `title` 识别（与既有环境差异比对一致）；同一 `title` 在有效发布中重复时（唯一约束生效前保存的历史记录）按 `title` 分组、组内按 `sequence` 从小到大逐条配对，多出的条目逐条计为 `added_changes`/`missing_changes`，字段不同逐条计为 `inconsistent_changes`；差异中的变更列表按 `title` 排序、同 `title` 按 `sequence` 排序（promotion-diff 的 `diff` 与之一致），重复查询结果稳定；节点发布事实中的变更保留记录里的原始顺序。
 - 时间（`recorded_at`）与版本字符串沿用服务既有格式；响应不含服务端生成时刻，相同输入重复查询结果逐字节一致。
 - 查询不写任何数据，不改写历史记录。
 
