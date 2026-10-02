@@ -61,19 +61,56 @@ func (s *Store) InsertReleaseRecord(record *ReleaseRecord) error {
 	// (environment, version) and batched rows unique per batch. Rows of the
 	// other batch flavor sharing the same environment and version still
 	// represent the same single effective release, so they conflict too.
+	//
+	// Sequential reuse of an environment and version across distinct batches
+	// stays legal, but several submissions arriving at the same time for the
+	// same (environment, version) pair form one concurrent wave: exactly one
+	// request may create the record and the rest conflict, so two requests can
+	// never pass the duplicate check side by side. The in-process gate catches
+	// that race; the database transaction below covers every other storage
+	// failure and rolls the whole write back as a unit.
+	gate := s.acquireReleaseGate(record.Environment, record.Version)
+	return gate.run(func(contended bool) error {
+		return s.insertReleaseRecordTx(record, contended)
+	})
+}
+
+// insertReleaseRecordTx performs the duplicate check, the main row insert and
+// every change-entry insert inside one immediate transaction. Any failure
+// rolls the transaction back, leaving no half-written record behind. When
+// contended is true the call lost a concurrent submission race, so the check
+// ignores batch boundaries: only one record per (environment, version) may
+// survive a single concurrent wave.
+func (s *Store) insertReleaseRecordTx(record *ReleaseRecord, contended bool) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("store: begin release record tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	checkQuery := `SELECT count(1) FROM release_records
+		WHERE environment = ? AND version = ?
+		  AND (batch_id = '' OR ? = '')
+		  AND batch_id != ?`
+	if contended {
+		checkQuery = `SELECT count(1) FROM release_records
+			WHERE environment = ? AND version = ?`
+	}
 	var existing int
-	if err := s.db.QueryRow(
-		`SELECT count(1) FROM release_records
-		 WHERE environment = ? AND version = ?
-		   AND (batch_id = '' OR ? = '')
-		   AND batch_id != ?`,
-		record.Environment, record.Version, record.BatchID, record.BatchID,
+	if err := tx.QueryRow(
+		checkQuery, record.Environment, record.Version, record.BatchID, record.BatchID,
 	).Scan(&existing); err != nil {
 		return fmt.Errorf("store: check release record: %w", err)
 	}
 	if existing > 0 {
 		return &ErrReleaseAlreadyExists{Environment: record.Environment, Version: record.Version}
 	}
+
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -81,7 +118,7 @@ func (s *Store) InsertReleaseRecord(record *ReleaseRecord) error {
 		if err != nil {
 			return fmt.Errorf("store: new release id: %w", err)
 		}
-		res, err := s.db.Exec(
+		res, err := tx.Exec(
 			`INSERT INTO release_records (public_id, environment, version, batch_id, gate_status, rollback_point)
 			 VALUES (?, ?, ?, ?, ?, ?)`,
 			id, record.Environment, record.Version, record.BatchID, record.GateStatus, record.RollbackPoint,
@@ -102,8 +139,13 @@ func (s *Store) InsertReleaseRecord(record *ReleaseRecord) error {
 		if err != nil {
 			return fmt.Errorf("store: insert release record: %w", err)
 		}
+		if releaseInsertFaultHook != nil {
+			if err := releaseInsertFaultHook(record, attempt, rowID); err != nil {
+				return fmt.Errorf("store: insert change entry: %w", err)
+			}
+		}
 		for i := range record.Changes {
-			if _, err := s.db.Exec(
+			if _, err := tx.Exec(
 				`INSERT INTO release_change_entries (record_id, sequence_no, category, title, description)
 				 VALUES (?, ?, ?, ?, ?)`,
 				rowID, record.Changes[i].Sequence, record.Changes[i].Category,
@@ -112,6 +154,11 @@ func (s *Store) InsertReleaseRecord(record *ReleaseRecord) error {
 				return fmt.Errorf("store: insert change entry: %w", err)
 			}
 		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("store: commit release record: %w", err)
+		}
+		committed = true
+
 		stored, err := s.GetReleaseRecord(id)
 		if err != nil {
 			return err

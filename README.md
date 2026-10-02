@@ -182,6 +182,11 @@ go run .
 | 同一环境同一版本重复提交 | 409 | `RELEASE_ALREADY_EXISTS` |
 | 必填字段缺失、类型不符、`sequence` 非法或重复、门禁枚举非法、回滚点为空白、`batch_id` 为空白或超长 | 422 | `RELEASE_VALIDATION_FAILED` |
 | 请求体不是合法 JSON | 400 | `invalid_request` |
+| 保存主记录或变更条目时存储失败 | 503 | `storage_unavailable` |
+
+落库是原子的：重复检查、发布主记录与全部变更条目在同一个事务内完成，任何一步失败都会整体回滚，不留可查询的半条记录；以相同字段和 `changes` 立即重试即可成功，不会与残留主记录冲突。
+
+同时发起的多个合法提交即使 `batch_id` 不同或请求内容不同，只要 `environment` 与 `version` 相同就构成同一并发波：恰好一个请求返回 201 和完整 `release_record`，其余返回 409 `RELEASE_ALREADY_EXISTS`，列表、单记录、历史与 release-comparison 都不会读到两条并行有效版本。落败请求在胜出记录已落库后重试仍是 409；先后发起（非同时）的不同批次复用仍遵循批次隔离模型。
 
 ### `GET /api/v1/release-records`
 

@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
@@ -42,6 +43,10 @@ func Is(err error, code string) bool {
 // Store is the persistence handle shared by the HTTP layer.
 type Store struct {
 	db *sql.DB
+
+	// releaseGates serializes concurrent release-record submissions for the
+	// same (environment, version) pair. One gate per key, never deleted.
+	releaseGates sync.Map
 }
 
 // Open connects to the SQLite file and applies the schema.
