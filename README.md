@@ -660,3 +660,59 @@ go run .
 | 追溯的变更条目不属于该批次 | 404 | `PROMOTION_CHANGE_NOT_FOUND` |
 
 单元素环境序列是合法的：链路返回一个节点、空 `segment_diffs` 与 `consistent: true`。序列校验先于批次存在性检查，因此未知批次配重复/未知环境时仍返回 400；选择器冲突、未知路线以及未绑定缺序列都在批次检查之前返回；批次存在性先于节点顺序检查。`promotion-diff` 继续只接受显式的 `from`/`to`，不读取路线或绑定，其行为与响应保持不变；环境差异查询（`environments` 与 `compare` 等入口）同样不受路线影响。查询不改写发布事实、不登记环境、不合并批次。
+
+## 发布批次发现 API（只读，/api/v1）
+
+两个只读入口用于发现批次全貌，只读取现有发布记录，不写任何数据，也不改变录入、比较、门禁与晋级追踪的既有行为。未分批（`batch_id` 为空）的记录永远不入选批次。
+
+### `GET /api/v1/release-batches`
+
+查询参数（均可省略，组合时按 AND 生效）：
+
+| 参数 | 含义 |
+|---|---|
+| `environment` | 批次在该环境有发布记录（必须是已登记环境键） |
+| `version` | 批次存在该版本的发布记录 |
+| `gate_status` | 批次存在该门禁状态的记录，仅接受 `allowed`、`blocked`、`pending` |
+| `from` | 批次存在不早于该时刻（含边界）的记录；RFC3339 时间戳或 `YYYY-MM-DD` 日期（日期按 UTC 当天 00:00:00） |
+| `to` | 批次存在不晚于该时刻（含边界）的记录；日期按 UTC 当天 23:59:59 |
+| `limit` | 每页批次数，默认 20，仅接受 1 到 100 的整数 |
+| `cursor` | 上一页返回的 `next_cursor`；翻页时必须带上与首页完全相同的筛选 |
+
+一个批次只要拥有一条同时满足全部条件的非空 `batch_id` 记录即入选；返回的汇总始终覆盖入选批次的**全部**记录（含不满足筛选的记录）。响应 200，外层只有 `batches` 与 `next_cursor` 两个键，末页 `next_cursor` 为 `null`：
+
+```json
+{
+  "batches": [
+    {
+      "batch_id": "b-2026-10-01",
+      "release_count": 3,
+      "environments": ["dev", "prod"],
+      "change_count": 5,
+      "gate_counts": {"allowed": 2, "blocked": 1, "pending": 0},
+      "last_recorded_at": "2026-10-01T09:00:00Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+- `environments` 为该批次全部记录涉及环境的升序去重列表（无记录则不可能入选，故始终非空）。
+- `change_count` 是该批次全部记录携带的变更条目总数；`gate_counts` 按记录的 `gate_status` 原值计数。
+- 排序固定为 `last_recorded_at` 从新到旧；同一时刻按 `batch_id` 从大到小。游标为签名不透明标记，绑定首页的全部筛选条件；缺绑定、损坏或筛选不符都返回 400。
+- 没有任何批次入选时返回 200、`"batches":[]` 与 `null` 的 `next_cursor`。
+
+### `GET /api/v1/release-batches/{batch_id}`
+
+按路径参数精确匹配批次，200 返回 `{"release_batch": {...}}`：汇总字段与列表项相同，另含 `releases`，即该批次的全部完整发布记录（与单条发布记录读取相同的字段与 `changes` 原顺序）。`releases` 按 `recorded_at` 从旧到新排列，同一时刻按内部写入顺序从新到旧。
+
+### 错误码
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| 参数不合法、`from`/`to` 时间无法解析、`gate_status` 非法、`limit` 越界（含空白）、`cursor` 空白/缺绑定/损坏/筛选不符 | 400 | `BATCH_QUERY_INVALID` |
+| `environment` 未登记 | 404 | `ENVIRONMENT_NOT_FOUND` |
+| 路径 `batch_id` 不存在 | 404 | `RELEASE_BATCH_NOT_FOUND` |
+| 数据库不可用 | 503 | `storage_unavailable` |
+
+查询参数校验先于环境登记检查与所有存储读取；游标校验在存储读取前完成。

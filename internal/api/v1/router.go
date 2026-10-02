@@ -22,6 +22,8 @@ func Register(engine *gin.Engine, deps Dependencies) {
 	group.POST("/release-records", createReleaseRecord(deps))
 	group.GET("/release-records", listReleaseRecords(deps))
 	group.GET("/release-records/:id", getReleaseRecord(deps))
+	group.GET("/release-batches", listReleaseBatches(deps))
+	group.GET("/release-batches/:batch_id", getReleaseBatch(deps))
 	group.POST("/release-records/:id/gate-evaluations", createGateEvaluation(deps))
 	group.GET("/release-records/:id/gate-evaluations", getGateEvaluation(deps))
 	group.GET("/gate-evaluations", listGateEvaluations(deps))

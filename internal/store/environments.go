@@ -33,6 +33,7 @@ const (
 	CodeInvalidHistoryPagination             = "INVALID_HISTORY_PAGINATION"
 	CodeInvalidChangeQueryV1                 = "INVALID_CHANGE_QUERY"
 	CodeInvalidReleaseRecordQueryV1          = "INVALID_RELEASE_RECORD_QUERY"
+	CodeBatchQueryInvalidV1                  = "BATCH_QUERY_INVALID"
 
 	// Per-environment release-state and rollback-impact queries.
 	CodeReleaseStateTimeInvalid   = "RELEASE_STATE_TIME_INVALID"
