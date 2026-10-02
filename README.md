@@ -199,8 +199,15 @@ go run .
 | `gate_status` | 门禁状态；非枚举值返回 422 `RELEASE_VALIDATION_FAILED` |
 | `recorded_from` / `recorded_to` | 记录时间闭区间，支持 RFC3339 时刻或 `YYYY-MM-DD` 日期（日期分别取当日 00:00:00 / 23:59:59 UTC）；无法解析返回 422 `RELEASE_VALIDATION_FAILED` |
 | `batch_id` | 精确匹配发布批次标识（仅写入时携带该字段的记录） |
+| `limit` | 每页条数，省略时为 20；显式空白、非整数、小于 1 或大于 100 返回 400 `INVALID_RELEASE_RECORD_QUERY` |
+| `cursor` | 上一页返回的不透明分页游标；首次请求省略。显式空白、截断、篡改（含签名不符）或与首次请求筛选快照不一致返回 400 `INVALID_RELEASE_RECORD_QUERY` |
 
-返回 200 `{"release_records":[...]}`，按 `recorded_at` 倒序；同一时刻再按写入顺序倒序，保证结果确定。空结果为 `[]`。
+返回 200，外层只有 `release_records` 与 `next_cursor` 两个键：按 `recorded_at` 从新到旧排序，同一秒按写入顺序从新到旧；每页至多 `limit` 条，记录字段、`changes` 原顺序以及 `batch_id` 仅在写入时存在的约定与单条读取一致。
+
+- 首次请求省略 `cursor`；有更多记录时 `next_cursor` 是 URL 安全、不暴露内部数据库主键的不透明值，末页或无命中时为空字符串 `""`（此时 `release_records` 分别为最后一页数组或确定的空数组 `[]`）。
+- 游标与六个筛选参数的规范化值及首次请求的查询快照绑定：筛选变化、显式空白、截断、篡改或换用其他查询的游标都返回 400 `INVALID_RELEASE_RECORD_QUERY`。`limit` 不与游标绑定，下一页可以调整每页条数。
+- 游标是键集位置：首次请求之后并发新增的记录不会插入本次遍历，也不会使已有记录重复或遗漏；新写入只影响之后发起的首次请求。相同数据与游标重复请求得到相同的后续页。
+- 存储不可用时返回 503 `storage_unavailable`；其余既有错误（未登记环境 404 `ENVIRONMENT_NOT_FOUND`、门禁枚举与时间格式 422 `RELEASE_VALIDATION_FAILED`、单错误 JSON 形状）不变。
 
 ### `GET /api/v1/release-records/{id}`
 

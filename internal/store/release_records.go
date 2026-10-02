@@ -260,6 +260,84 @@ func (s *Store) ListReleaseRecords(filter ReleaseRecordFilter) ([]ReleaseRecord,
 	return s.queryReleaseRecords(query, args...)
 }
 
+// ListReleaseRecordsPage returns one keyset page of records matching filter
+// in the same newest-first order ListReleaseRecords uses. The anchor marks
+// the last record already returned (recorded_at desc, internal id desc for
+// same-second ties); zero anchor values request the first page. Up to
+// limit+1 records are fetched so the caller can detect a following page.
+//
+// Keyset paging makes the walk stable against concurrent inserts: rows added
+// after the first request sort ahead of every anchor and never enter a later
+// page, so already-seen records are neither repeated nor skipped.
+func (s *Store) ListReleaseRecordsPage(
+	filter ReleaseRecordFilter,
+	anchorRecordedAt string,
+	anchorID int64,
+	limit int,
+) ([]ReleaseRecord, error) {
+	where := []string{}
+	args := []any{}
+	if filter.Environment != "" {
+		where = append(where, `environment = ?`)
+		args = append(args, filter.Environment)
+	}
+	if filter.Version != "" {
+		where = append(where, `version = ?`)
+		args = append(args, filter.Version)
+	}
+	if filter.BatchID != "" {
+		where = append(where, `batch_id = ?`)
+		args = append(args, filter.BatchID)
+	}
+	if filter.GateStatus != "" {
+		where = append(where, `gate_status = ?`)
+		args = append(args, filter.GateStatus)
+	}
+	if filter.From != "" {
+		where = append(where, `recorded_at >= ?`)
+		args = append(args, filter.From)
+	}
+	if filter.To != "" {
+		where = append(where, `recorded_at <= ?`)
+		args = append(args, filter.To)
+	}
+	if anchorID > 0 {
+		where = append(where, `(recorded_at < ? OR (recorded_at = ? AND id < ?))`)
+		args = append(args, anchorRecordedAt, anchorRecordedAt, anchorID)
+	}
+	query := `SELECT r.id, r.` + strings.ReplaceAll(releaseRecordColumns, ", ", ", r.") +
+		`, e.sequence_no, e.category, e.title, e.description
+		 FROM (
+		   SELECT id, recorded_at FROM release_records`
+	if len(where) > 0 {
+		query += ` WHERE ` + strings.Join(where, ` AND `)
+	}
+	query += ` ORDER BY recorded_at DESC, id DESC LIMIT ?
+		 ) AS page
+		 JOIN release_records r ON r.id = page.id
+		 LEFT JOIN release_change_entries e ON e.record_id = r.id
+		 ORDER BY page.recorded_at DESC, page.id DESC, e.sequence_no ASC, e.id ASC`
+	args = append(args, limit+1)
+	return s.queryReleaseRecords(query, args...)
+}
+
+// ResolveReleaseRecordPosition maps a record's stable public identifier to
+// its internal keyset position (recorded_at, internal id). Records are
+// immutable and never deleted, so a position resolved for a cursor keeps
+// pointing at the same row. It returns ok == false when no record exists.
+func (s *Store) ResolveReleaseRecordPosition(publicID string) (recordedAt string, id int64, ok bool, err error) {
+	err = s.db.QueryRow(
+		`SELECT recorded_at, id FROM release_records WHERE public_id = ?`, publicID,
+	).Scan(&recordedAt, &id)
+	if err == sql.ErrNoRows {
+		return "", 0, false, nil
+	}
+	if err != nil {
+		return "", 0, false, fmt.Errorf("store: resolve release record position: %w", err)
+	}
+	return recordedAt, id, true, nil
+}
+
 // EffectiveReleaseRecord returns the newest record for an environment and
 // version, or (nil, nil) when absent. The (environment, version) pair is
 // unique for new records, but this keeps the same "latest wins" read

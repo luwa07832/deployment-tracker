@@ -1,6 +1,10 @@
 package v1
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -14,6 +18,25 @@ import (
 )
 
 var validGateStatuses = map[string]bool{"allowed": true, "blocked": true, "pending": true}
+
+const (
+	defaultReleaseRecordLimit = 20
+	maxReleaseRecordLimit     = 100
+)
+
+// releaseRecordCursorSigningKey signs opaque pagination cursors so a
+// truncated, forged or condition-rebound cursor cannot be mistaken for a
+// valid one. The key is process-private randomness; cursors never need to
+// survive a restart.
+var releaseRecordCursorSigningKey = newReleaseRecordCursorSigningKey()
+
+func newReleaseRecordCursorSigningKey() []byte {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		panic(err)
+	}
+	return key
+}
 
 type changeEntryInput struct {
 	Sequence    *int    `json:"sequence"`
@@ -198,7 +221,66 @@ func validateRecordInput(input *createRecordInput) (*store.ReleaseRecord, string
 	}, ""
 }
 
-// listReleaseRecords answers filtered queries ordered newest first.
+// releaseRecordCursorFilter is the normalized snapshot of the six filter
+// conditions taken by the first request and bound to every cursor it mints.
+type releaseRecordCursorFilter struct {
+	Environment string `json:"environment"`
+	Version     string `json:"version"`
+	BatchID     string `json:"batch_id"`
+	GateStatus  string `json:"gate_status"`
+	From        string `json:"from"`
+	To          string `json:"to"`
+}
+
+// releaseRecordCursor is the signed, opaque keyset marker. The position uses
+// only the stable public identifier, never the internal database primary key.
+type releaseRecordCursor struct {
+	Filter   releaseRecordCursorFilter `json:"f"`
+	PublicID string                    `json:"id"`
+}
+
+func encodeReleaseRecordCursor(cursor releaseRecordCursor) string {
+	payload, _ := json.Marshal(cursor)
+	mac := hmac.New(sha256.New, releaseRecordCursorSigningKey)
+	mac.Write(payload)
+	return base64.RawURLEncoding.EncodeToString(payload) + "." +
+		base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// decodeReleaseRecordCursor validates the shape, signature and filter binding
+// of a cursor. Any tampering, truncation or condition mismatch yields false.
+func decodeReleaseRecordCursor(raw string, expected releaseRecordCursorFilter) (string, bool) {
+	parts := strings.Split(strings.TrimSpace(raw), ".")
+	if len(parts) != 2 {
+		return "", false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		return "", false
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", false
+	}
+	mac := hmac.New(sha256.New, releaseRecordCursorSigningKey)
+	mac.Write(payload)
+	if !hmac.Equal(signature, mac.Sum(nil)) {
+		return "", false
+	}
+	var cursor releaseRecordCursor
+	if err := json.Unmarshal(payload, &cursor); err != nil {
+		return "", false
+	}
+	if cursor.Filter != expected || cursor.PublicID == "" {
+		return "", false
+	}
+	return cursor.PublicID, true
+}
+
+// listReleaseRecords answers filtered, stable keyset pages ordered newest
+// first (recorded_at descending, write order descending within the same
+// second). The first request omits cursor; each following request passes the
+// previous response's next_cursor.
 func listReleaseRecords(deps Dependencies) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		environment := strings.TrimSpace(c.Query("environment"))
@@ -208,14 +290,32 @@ func listReleaseRecords(deps Dependencies) gin.HandlerFunc {
 			BatchID:     strings.TrimSpace(c.Query("batch_id")),
 			GateStatus:  strings.TrimSpace(c.Query("gate_status")),
 		}
-		if environment != "" && !requireEnvironment(c, deps, environment) {
+
+		// Query-shape validation (including a blank, non-integer or out-of-range
+		// limit and a blank cursor) happens before the environment registration
+		// check, matching the other paginated read endpoints.
+		limit := defaultReleaseRecordLimit
+		if raw, present := c.GetQuery("limit"); present {
+			raw = strings.TrimSpace(raw)
+			if raw == "" {
+				fail(c, http.StatusBadRequest, store.CodeInvalidReleaseRecordQueryV1,
+					"limit must not be blank when provided")
+				return
+			}
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 1 || parsed > maxReleaseRecordLimit {
+				fail(c, http.StatusBadRequest, store.CodeInvalidReleaseRecordQueryV1,
+					"limit must be an integer between 1 and "+strconv.Itoa(maxReleaseRecordLimit))
+				return
+			}
+			limit = parsed
+		}
+		if raw, present := c.GetQuery("cursor"); present && strings.TrimSpace(raw) == "" {
+			fail(c, http.StatusBadRequest, store.CodeInvalidReleaseRecordQueryV1,
+				"cursor must not be blank when provided")
 			return
 		}
-		if filter.GateStatus != "" && !validGateStatuses[filter.GateStatus] {
-			fail(c, http.StatusUnprocessableEntity, store.CodeReleaseValidationV1,
-				"gate_status must be one of: allowed, blocked, pending")
-			return
-		}
+
 		if raw := strings.TrimSpace(c.Query("recorded_from")); raw != "" {
 			bound, err := parseTimeBound(raw, false)
 			if err != nil {
@@ -234,12 +334,67 @@ func listReleaseRecords(deps Dependencies) gin.HandlerFunc {
 			}
 			filter.To = bound
 		}
-		records, err := deps.Store.ListReleaseRecords(filter)
-		if err != nil {
-			fail(c, http.StatusInternalServerError, store.CodeStorageUnavailable, "database is not available")
+
+		cursorFilter := releaseRecordCursorFilter{
+			Environment: filter.Environment,
+			Version:     filter.Version,
+			BatchID:     filter.BatchID,
+			GateStatus:  filter.GateStatus,
+			From:        filter.From,
+			To:          filter.To,
+		}
+		var anchorRecordedAt string
+		var anchorID int64
+		if raw := strings.TrimSpace(c.Query("cursor")); raw != "" {
+			publicID, valid := decodeReleaseRecordCursor(raw, cursorFilter)
+			if !valid {
+				fail(c, http.StatusBadRequest, store.CodeInvalidReleaseRecordQueryV1,
+					"cursor is not valid for this query")
+				return
+			}
+			recordedAt, id, found, err := deps.Store.ResolveReleaseRecordPosition(publicID)
+			if err != nil {
+				fail(c, http.StatusServiceUnavailable, store.CodeStorageUnavailable,
+					"database is not available")
+				return
+			}
+			if !found {
+				fail(c, http.StatusBadRequest, store.CodeInvalidReleaseRecordQueryV1,
+					"cursor is not valid for this query")
+				return
+			}
+			anchorRecordedAt = recordedAt
+			anchorID = id
+		}
+
+		if environment != "" && !requireEnvironment(c, deps, environment) {
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"release_records": toRecordViews(records)})
+		if filter.GateStatus != "" && !validGateStatuses[filter.GateStatus] {
+			fail(c, http.StatusUnprocessableEntity, store.CodeReleaseValidationV1,
+				"gate_status must be one of: allowed, blocked, pending")
+			return
+		}
+
+		records, err := deps.Store.ListReleaseRecordsPage(filter, anchorRecordedAt, anchorID, limit)
+		if err != nil {
+			fail(c, http.StatusServiceUnavailable, store.CodeStorageUnavailable, "database is not available")
+			return
+		}
+
+		nextCursor := ""
+		if len(records) > limit {
+			last := records[limit-1]
+			nextCursor = encodeReleaseRecordCursor(releaseRecordCursor{
+				Filter:   cursorFilter,
+				PublicID: last.PublicID,
+			})
+			records = records[:limit]
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"release_records": toRecordViews(records),
+			"next_cursor":     nextCursor,
+		})
 	}
 }
 

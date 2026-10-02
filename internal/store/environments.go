@@ -32,6 +32,7 @@ const (
 	CodeInvalidReleaseComparisonQuery        = "INVALID_RELEASE_COMPARISON_QUERY"
 	CodeInvalidHistoryPagination             = "INVALID_HISTORY_PAGINATION"
 	CodeInvalidChangeQueryV1                 = "INVALID_CHANGE_QUERY"
+	CodeInvalidReleaseRecordQueryV1          = "INVALID_RELEASE_RECORD_QUERY"
 )
 
 // TrackedEnvironment is an environment that may receive release records.
