@@ -299,3 +299,43 @@ func TestListReleaseRecordHistoryKeepsAllEntriesPerRecord(t *testing.T) {
 		t.Fatalf("LIMIT must apply to records, not joined entry rows: got %d entries", len(page[0].Changes))
 	}
 }
+
+func TestListReleaseRecordsPageKeyset(t *testing.T) {
+	db := openTestStore(t)
+	for _, version := range []string{"1.0.0", "1.0.1", "1.0.2", "1.0.3"} {
+		record := sampleRecord("prod", version, "allowed", "snapshot:0.9.0",
+			entries("change-"+version)...)
+		if err := db.InsertReleaseRecord(record); err != nil {
+			t.Fatalf("insert %s: %v", version, err)
+		}
+	}
+
+	first, err := db.ListReleaseRecordsPage(ReleaseRecordFilter{Environment: "prod"}, "", 0, 2)
+	if err != nil || len(first) != 3 {
+		t.Fatalf("first page = %d records, %v; want 3 (limit+1)", len(first), err)
+	}
+	if first[0].Version != "1.0.3" || first[1].Version != "1.0.2" {
+		t.Fatalf("first page order = %s, %s", first[0].Version, first[1].Version)
+	}
+	anchor := first[1]
+	second, err := db.ListReleaseRecordsPage(
+		ReleaseRecordFilter{Environment: "prod"}, anchor.RecordedAt, anchor.ID, 2)
+	if err != nil {
+		t.Fatalf("second page: %v", err)
+	}
+	if len(second) != 2 || second[0].Version != "1.0.1" || second[1].Version != "1.0.0" {
+		t.Fatalf("second page = %+v, want 1.0.1 then 1.0.0", second)
+	}
+	seen := map[string]bool{first[0].Version: true, first[1].Version: true}
+	for _, record := range second {
+		if seen[record.Version] {
+			t.Fatalf("record %s appeared on two pages", record.Version)
+		}
+	}
+
+	filtered, err := db.ListReleaseRecordsPage(
+		ReleaseRecordFilter{Environment: "prod", Version: "1.0.1"}, "", 0, 20)
+	if err != nil || len(filtered) != 1 || filtered[0].Version != "1.0.1" {
+		t.Fatalf("filtered page = %+v, %v", filtered, err)
+	}
+}

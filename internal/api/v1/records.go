@@ -201,6 +201,28 @@ func validateRecordInput(input *createRecordInput) (*store.ReleaseRecord, string
 // listReleaseRecords answers filtered queries ordered newest first.
 func listReleaseRecords(deps Dependencies) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		const defaultLimit = 20
+		const maxLimit = 100
+		if raw := c.Query("limit"); strings.TrimSpace(raw) == "" && c.Request.URL.Query().Has("limit") {
+			fail(c, http.StatusBadRequest, store.CodeInvalidReleaseRecordQueryV1,
+				"limit must be an integer between 1 and "+strconv.Itoa(maxLimit))
+			return
+		}
+		limit := defaultLimit
+		if raw := strings.TrimSpace(c.Query("limit")); raw != "" {
+			parsed, err := strconv.Atoi(raw)
+			if err != nil || parsed < 1 || parsed > maxLimit {
+				fail(c, http.StatusBadRequest, store.CodeInvalidReleaseRecordQueryV1,
+					"limit must be an integer between 1 and "+strconv.Itoa(maxLimit))
+				return
+			}
+			limit = parsed
+		}
+		if raw := c.Query("cursor"); strings.TrimSpace(raw) == "" && c.Request.URL.Query().Has("cursor") {
+			fail(c, http.StatusBadRequest, store.CodeInvalidReleaseRecordQueryV1,
+				"cursor is not a valid pagination cursor")
+			return
+		}
 		environment := strings.TrimSpace(c.Query("environment"))
 		filter := store.ReleaseRecordFilter{
 			Environment: environment,
@@ -234,12 +256,41 @@ func listReleaseRecords(deps Dependencies) gin.HandlerFunc {
 			}
 			filter.To = bound
 		}
-		records, err := deps.Store.ListReleaseRecords(filter)
+		var afterRecordedAt string
+		var afterID int64
+		if raw := strings.TrimSpace(c.Query("cursor")); raw != "" {
+			pos, ok := decodeReleaseRecordCursor(raw, releaseFilterCursor(filter))
+			if !ok {
+				fail(c, http.StatusBadRequest, store.CodeInvalidReleaseRecordQueryV1,
+					"cursor is not a valid pagination cursor")
+				return
+			}
+			afterRecordedAt = pos.RecordedAt
+			afterID = pos.ID
+		}
+		records, err := deps.Store.ListReleaseRecordsPage(filter, afterRecordedAt, afterID, limit)
 		if err != nil {
-			fail(c, http.StatusInternalServerError, store.CodeStorageUnavailable, "database is not available")
+			fail(c, http.StatusServiceUnavailable, store.CodeStorageUnavailable, "database is not available")
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{"release_records": toRecordViews(records)})
+		nextCursor := ""
+		if len(records) > limit {
+			last := records[limit-1]
+			encoded, err := encodeReleaseRecordCursor(releaseRecordCursor{
+				Filter: releaseFilterCursor(filter),
+				Pos:    releaseCursorPos{RecordedAt: last.RecordedAt, ID: last.ID},
+			})
+			if err != nil {
+				fail(c, http.StatusServiceUnavailable, store.CodeStorageUnavailable, "database is not available")
+				return
+			}
+			nextCursor = encoded
+			records = records[:limit]
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"release_records": toRecordViews(records),
+			"next_cursor":     nextCursor,
+		})
 	}
 }
 

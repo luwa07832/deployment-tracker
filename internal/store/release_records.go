@@ -260,6 +260,65 @@ func (s *Store) ListReleaseRecords(filter ReleaseRecordFilter) ([]ReleaseRecord,
 	return s.queryReleaseRecords(query, args...)
 }
 
+// ListReleaseRecordsPage returns one page of records matching the filter in
+// the same order ListReleaseRecords uses: recorded_at descending, then
+// internal id descending for same-second write order. The keyset anchor
+// (afterRecordedAt, afterID) marks the last row already returned; zero
+// values request the first page. Up to limit+1 rows are fetched so the
+// caller can detect a following page without any offset, which keeps
+// concurrent inserts from interleaving with or shifting the paged result.
+func (s *Store) ListReleaseRecordsPage(
+	filter ReleaseRecordFilter,
+	afterRecordedAt string,
+	afterID int64,
+	limit int,
+) ([]ReleaseRecord, error) {
+	where := []string{}
+	args := []any{}
+	if filter.Environment != "" {
+		where = append(where, `environment = ?`)
+		args = append(args, filter.Environment)
+	}
+	if filter.Version != "" {
+		where = append(where, `version = ?`)
+		args = append(args, filter.Version)
+	}
+	if filter.BatchID != "" {
+		where = append(where, `batch_id = ?`)
+		args = append(args, filter.BatchID)
+	}
+	if filter.GateStatus != "" {
+		where = append(where, `gate_status = ?`)
+		args = append(args, filter.GateStatus)
+	}
+	if filter.From != "" {
+		where = append(where, `recorded_at >= ?`)
+		args = append(args, filter.From)
+	}
+	if filter.To != "" {
+		where = append(where, `recorded_at <= ?`)
+		args = append(args, filter.To)
+	}
+	if afterID > 0 {
+		where = append(where, `(recorded_at < ? OR (recorded_at = ? AND id < ?))`)
+		args = append(args, afterRecordedAt, afterRecordedAt, afterID)
+	}
+	pageQuery := `SELECT id, recorded_at FROM release_records`
+	if len(where) > 0 {
+		pageQuery += ` WHERE ` + strings.Join(where, ` AND `)
+	}
+	pageQuery += ` ORDER BY recorded_at DESC, id DESC LIMIT ?`
+	args = append(args, limit+1)
+
+	query := `SELECT r.id, r.` + strings.ReplaceAll(releaseRecordColumns, ", ", ", r.") +
+		`, e.sequence_no, e.category, e.title, e.description
+		 FROM (` + pageQuery + `) AS page
+		 JOIN release_records r ON r.id = page.id
+		 LEFT JOIN release_change_entries e ON e.record_id = r.id
+		 ORDER BY page.recorded_at DESC, page.id DESC, e.sequence_no ASC, e.id ASC`
+	return s.queryReleaseRecords(query, args...)
+}
+
 // EffectiveReleaseRecord returns the newest record for an environment and
 // version, or (nil, nil) when absent. The (environment, version) pair is
 // unique for new records, but this keeps the same "latest wins" read
