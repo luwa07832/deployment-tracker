@@ -1,6 +1,7 @@
 package store
 
 import (
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -297,5 +298,177 @@ func TestListReleaseRecordHistoryKeepsAllEntriesPerRecord(t *testing.T) {
 	}
 	if len(page[0].Changes) != 3 {
 		t.Fatalf("LIMIT must apply to records, not joined entry rows: got %d entries", len(page[0].Changes))
+	}
+}
+
+func TestInsertReleaseRecordRollsBackWhenChangeEntryFails(t *testing.T) {
+	db := openTestStore(t)
+	if _, err := db.EnsureEnvironment(&TrackedEnvironment{Environment: "prod"}); err != nil {
+		t.Fatalf("ensure env: %v", err)
+	}
+	// Make the second change entry fail so the master row write cannot commit.
+	if _, err := db.db.Exec(`
+CREATE TRIGGER fail_second_change
+AFTER INSERT ON release_change_entries
+BEGIN
+  SELECT CASE WHEN NEW.sequence_no = 2
+    THEN RAISE(ABORT, 'simulated storage failure')
+  END;
+END;`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	record := sampleRecord("prod", "1.2.0", "allowed", "snapshot:1.1.0",
+		ChangeEntry{Sequence: 1, Category: "feature", Title: "a", Description: "first"},
+		ChangeEntry{Sequence: 2, Category: "fix", Title: "b", Description: "second"},
+	)
+	if err := db.InsertReleaseRecord(record); err == nil {
+		t.Fatal("insert must fail when a change entry cannot be stored")
+	}
+
+	var masters, entries int
+	if err := db.db.QueryRow(`SELECT count(1) FROM release_records WHERE environment = 'prod' AND version = '1.2.0'`).
+		Scan(&masters); err != nil {
+		t.Fatalf("count masters: %v", err)
+	}
+	if masters != 0 {
+		t.Fatalf("master row survived the rollback: %d rows", masters)
+	}
+	if err := db.db.QueryRow(`SELECT count(1) FROM release_change_entries`).Scan(&entries); err != nil {
+		t.Fatalf("count entries: %v", err)
+	}
+	if entries != 0 {
+		t.Fatalf("change entries survived the rollback: %d rows", entries)
+	}
+
+	// Once storage recovers, retrying the same payload must create the record
+	// instead of colliding with a half-written row.
+	if _, err := db.db.Exec(`DROP TRIGGER fail_second_change`); err != nil {
+		t.Fatalf("drop trigger: %v", err)
+	}
+	retry := sampleRecord("prod", "1.2.0", "allowed", "snapshot:1.1.0",
+		ChangeEntry{Sequence: 1, Category: "feature", Title: "a", Description: "first"},
+		ChangeEntry{Sequence: 2, Category: "fix", Title: "b", Description: "second"},
+	)
+	if err := db.InsertReleaseRecord(retry); err != nil {
+		t.Fatalf("retry after rollback: %v", err)
+	}
+	got, err := db.GetReleaseRecord(retry.PublicID)
+	if err != nil || got == nil || len(got.Changes) != 2 {
+		t.Fatalf("retried record = %+v, %v", got, err)
+	}
+}
+
+func TestConcurrentInsertSameEnvironmentVersionSerializesToOneWinner(t *testing.T) {
+	db := openTestStore(t)
+	if _, err := db.EnsureEnvironment(&TrackedEnvironment{Environment: "prod"}); err != nil {
+		t.Fatalf("ensure env: %v", err)
+	}
+	const submitters = 16
+	start := make(chan struct{})
+	errs := make(chan error, submitters)
+	for i := 0; i < submitters; i++ {
+		record := sampleRecord("prod", "7.7.7", "allowed", "rb:7.0.0",
+			ChangeEntry{Sequence: 1, Category: "feature", Title: "only", Description: "one winner"},
+		)
+		record.BatchID = "batch-" + string(rune('a'+i%26))
+		go func(record *ReleaseRecord) {
+			<-start
+			errs <- db.InsertReleaseRecord(record)
+		}(record)
+	}
+	close(start)
+	winners, conflicts := 0, 0
+	for i := 0; i < submitters; i++ {
+		err := <-errs
+		switch {
+		case err == nil:
+			winners++
+		case errors.As(err, new(*ErrReleaseAlreadyExists)):
+			conflicts++
+		default:
+			t.Fatalf("unexpected insert error: %v", err)
+		}
+	}
+	if winners != 1 || conflicts != submitters-1 {
+		t.Fatalf("winners = %d, conflicts = %d, want 1 and %d", winners, conflicts, submitters-1)
+	}
+	listed, err := db.ListReleaseRecords(ReleaseRecordFilter{Environment: "prod", Version: "7.7.7"})
+	if err != nil || len(listed) != 1 || len(listed[0].Changes) != 1 {
+		t.Fatalf("parallel effective versions survived: %+v, %v", listed, err)
+	}
+	effective, err := db.EffectiveReleaseRecord("prod", "7.7.7")
+	if err != nil || effective == nil || effective.PublicID != listed[0].PublicID {
+		t.Fatalf("effective read = %+v, %v", effective, err)
+	}
+}
+
+func TestFirstWriteAfterLegacySchemaUpgradeIsAtomic(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy-first-write.db")
+	raw, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open raw: %v", err)
+	}
+	if _, err := raw.Exec(`
+CREATE TABLE tracked_environments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, environment TEXT NOT NULL UNIQUE,
+  display_name TEXT NOT NULL DEFAULT '',
+  registered_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE TABLE release_records (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, public_id TEXT NOT NULL UNIQUE,
+  environment TEXT NOT NULL, version TEXT NOT NULL,
+  gate_status TEXT NOT NULL, rollback_point TEXT NOT NULL,
+  recorded_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+  UNIQUE (environment, version)
+);
+CREATE TABLE release_change_entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, record_id INTEGER NOT NULL REFERENCES release_records(id),
+  sequence_no INTEGER NOT NULL, category TEXT NOT NULL, title TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT ''
+);
+INSERT INTO release_records (id, public_id, environment, version, gate_status, rollback_point)
+  VALUES (3, 'rel_old000000000000000000000000000001', 'prod', '0.9.0', 'allowed', 'rb:0.8.0');
+INSERT INTO release_change_entries (record_id, sequence_no, category, title, description)
+  VALUES (3, 1, 'feature', 'old', 'kept');
+`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("close raw: %v", err)
+	}
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("open migrated: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if _, err := db.EnsureEnvironment(&TrackedEnvironment{Environment: "prod"}); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+
+	record := sampleRecord("prod", "1.0.0", "allowed", "rb:0.9.0",
+		ChangeEntry{Sequence: 1, Category: "feature", Title: "upgraded", Description: "first write after upgrade"},
+		ChangeEntry{Sequence: 2, Category: "fix", Title: "second", Description: "also complete"},
+	)
+	if err := db.InsertReleaseRecord(record); err != nil {
+		t.Fatalf("first write after upgrade: %v", err)
+	}
+	got, err := db.GetReleaseRecord(record.PublicID)
+	if err != nil || got == nil {
+		t.Fatalf("read back new record: %+v, %v", got, err)
+	}
+	if got.ID != 4 || len(got.Changes) != 2 || got.Changes[1].Title != "second" {
+		t.Fatalf("new row = %+v", got)
+	}
+	// The pre-upgrade row, including its id, timestamps and entries, is intact.
+	old, err := db.GetReleaseRecord("rel_old000000000000000000000000000001")
+	if err != nil || old == nil || old.ID != 3 || len(old.Changes) != 1 || old.Changes[0].Title != "old" {
+		t.Fatalf("legacy row changed: %+v, %v", old, err)
+	}
+	// Global (environment, version) uniqueness holds against the legacy row too.
+	duplicate := sampleRecord("prod", "0.9.0", "blocked", "rb:0.7.0", entries("x")...)
+	duplicate.BatchID = "batch-new"
+	err = db.InsertReleaseRecord(duplicate)
+	if !errors.As(err, new(*ErrReleaseAlreadyExists)) {
+		t.Fatalf("duplicate of legacy env/version err = %v, want conflict", err)
 	}
 }

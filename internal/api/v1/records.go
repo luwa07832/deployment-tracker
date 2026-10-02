@@ -108,7 +108,7 @@ func createReleaseRecord(deps Dependencies) gin.HandlerFunc {
 					"a release for "+record.Environment+" "+record.Version+" already exists")
 				return
 			}
-			fail(c, http.StatusInternalServerError, store.CodeStorageUnavailable, "database is not available")
+			fail(c, http.StatusServiceUnavailable, store.CodeStorageUnavailable, "database is not available")
 			return
 		}
 		c.JSON(http.StatusCreated, gin.H{"release_record": toRecordView(record)})

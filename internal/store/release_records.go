@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -53,73 +54,110 @@ func (e *ErrReleaseAlreadyExists) Error() string {
 	return "release record " + e.Environment + " " + e.Version + " already exists"
 }
 
-// InsertReleaseRecord stores one release record, generating the stable public
-// identifier and server-side recorded_at. A duplicate (environment, version)
-// pair returns *ErrReleaseAlreadyExists.
+// InsertReleaseRecord stores one release record atomically: the duplicate
+// check, the master row and every change entry share one immediate write
+// transaction, so a failure while saving entries rolls the whole submission
+// back and the same payload can be retried without a half-written row. The
+// stable public identifier and server-side recorded_at are generated here. A
+// duplicate (environment, version) pair, regardless of batch_id, returns
+// *ErrReleaseAlreadyExists.
 func (s *Store) InsertReleaseRecord(record *ReleaseRecord) error {
-	// The batch-aware partial indexes keep unbatched rows unique on
-	// (environment, version) and batched rows unique per batch. Rows of the
-	// other batch flavor sharing the same environment and version still
-	// represent the same single effective release, so they conflict too.
+	ctx := context.Background()
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("store: open write connection: %w", err)
+	}
+	defer conn.Close()
+	// An immediate transaction takes the write lock up front, turning the
+	// duplicate check and the inserts below into one serializable critical
+	// section for concurrent submitters rather than a check-then-act race.
+	if _, err := conn.ExecContext(ctx, `BEGIN IMMEDIATE`); err != nil {
+		return fmt.Errorf("store: begin release record tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, `ROLLBACK`)
+		}
+	}()
+
 	var existing int
-	if err := s.db.QueryRow(
-		`SELECT count(1) FROM release_records
-		 WHERE environment = ? AND version = ?
-		   AND (batch_id = '' OR ? = '')
-		   AND batch_id != ?`,
-		record.Environment, record.Version, record.BatchID, record.BatchID,
+	if err := conn.QueryRowContext(ctx,
+		`SELECT count(1) FROM release_records WHERE environment = ? AND version = ?`,
+		record.Environment, record.Version,
 	).Scan(&existing); err != nil {
 		return fmt.Errorf("store: check release record: %w", err)
 	}
 	if existing > 0 {
 		return &ErrReleaseAlreadyExists{Environment: record.Environment, Version: record.Version}
 	}
-	const maxAttempts = 3
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		id, err := newPublicID()
+
+	const maxIDAttempts = 3
+	var (
+		rowID  int64
+		id     string
+		stored bool
+	)
+	for attempt := 0; attempt < maxIDAttempts; attempt++ {
+		id, err = newPublicID()
 		if err != nil {
 			return fmt.Errorf("store: new release id: %w", err)
 		}
-		res, err := s.db.Exec(
+		res, insertErr := conn.ExecContext(ctx,
 			`INSERT INTO release_records (public_id, environment, version, batch_id, gate_status, rollback_point)
 			 VALUES (?, ?, ?, ?, ?, ?)`,
 			id, record.Environment, record.Version, record.BatchID, record.GateStatus, record.RollbackPoint,
 		)
-		if err != nil {
-			if isUniqueViolation(err) {
-				message := strings.ToLower(err.Error())
+		if insertErr != nil {
+			if isUniqueViolation(insertErr) {
+				message := strings.ToLower(insertErr.Error())
 				if strings.Contains(message, "release_records.environment") ||
 					strings.Contains(message, "release_records_env_version") {
 					return &ErrReleaseAlreadyExists{Environment: record.Environment, Version: record.Version}
 				}
-				lastErr = err
+				// Only a public_id collision reaches here; a single failed
+				// statement does not abort the immediate transaction, so the
+				// loop can retry with a fresh identifier.
 				continue
 			}
-			return fmt.Errorf("store: insert release record: %w", err)
+			return fmt.Errorf("store: insert release record: %w", insertErr)
 		}
-		rowID, err := res.LastInsertId()
+		rowID, err = res.LastInsertId()
 		if err != nil {
 			return fmt.Errorf("store: insert release record: %w", err)
 		}
-		for i := range record.Changes {
-			if _, err := s.db.Exec(
-				`INSERT INTO release_change_entries (record_id, sequence_no, category, title, description)
-				 VALUES (?, ?, ?, ?, ?)`,
-				rowID, record.Changes[i].Sequence, record.Changes[i].Category,
-				record.Changes[i].Title, record.Changes[i].Description,
-			); err != nil {
-				return fmt.Errorf("store: insert change entry: %w", err)
-			}
-		}
-		stored, err := s.GetReleaseRecord(id)
-		if err != nil {
-			return err
-		}
-		*record = *stored
-		return nil
+		stored = true
+		break
 	}
-	return fmt.Errorf("store: insert release record: %w", lastErr)
+	if !stored {
+		return fmt.Errorf("store: insert release record: could not allocate a unique public id")
+	}
+
+	for i := range record.Changes {
+		if _, err := conn.ExecContext(ctx,
+			`INSERT INTO release_change_entries (record_id, sequence_no, category, title, description)
+			 VALUES (?, ?, ?, ?, ?)`,
+			rowID, record.Changes[i].Sequence, record.Changes[i].Category,
+			record.Changes[i].Title, record.Changes[i].Description,
+		); err != nil {
+			return fmt.Errorf("store: insert change entry: %w", err)
+		}
+	}
+
+	var recordedAt string
+	if err := conn.QueryRowContext(ctx,
+		`SELECT recorded_at FROM release_records WHERE id = ?`, rowID,
+	).Scan(&recordedAt); err != nil {
+		return fmt.Errorf("store: read back release record: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, `COMMIT`); err != nil {
+		return fmt.Errorf("store: commit release record: %w", err)
+	}
+	committed = true
+	record.ID = rowID
+	record.PublicID = id
+	record.RecordedAt = recordedAt
+	return nil
 }
 
 // GetReleaseRecord returns one record by its stable public identifier, or

@@ -9,7 +9,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func TestBatchIsolationAcrossBatchesSharingVersion(t *testing.T) {
+func TestBatchesSharingEnvironmentVersionConflict(t *testing.T) {
 	db := openTestStore(t)
 	for _, env := range []string{"dev", "test", "prod"} {
 		if _, err := db.EnsureEnvironment(&TrackedEnvironment{Environment: env}); err != nil {
@@ -23,13 +23,18 @@ func TestBatchIsolationAcrossBatchesSharingVersion(t *testing.T) {
 	if err := db.InsertReleaseRecord(batchA); err != nil {
 		t.Fatalf("insert batch-1: %v", err)
 	}
-	if err := db.InsertReleaseRecord(batchB); err != nil {
-		t.Fatalf("same version in a different batch must be allowed: %v", err)
+	if err := db.InsertReleaseRecord(batchB); err == nil {
+		t.Fatal("same env/version in a different batch must conflict")
+	}
+	// The rejected submission must leave nothing behind.
+	gotB, err := db.ListReleaseRecords(ReleaseRecordFilter{BatchID: "batch-2"})
+	if err != nil || len(gotB) != 0 {
+		t.Fatalf("conflicted batch-2 row survived: %+v, %v", gotB, err)
 	}
 	// Re-posting the same batch/env/version is still a conflict.
 	dup := sampleRecord("dev", "1.0.0", "blocked", "rb:0.8.0", entries("c")...)
 	dup.BatchID = "batch-1"
-	err := db.InsertReleaseRecord(dup)
+	err = db.InsertReleaseRecord(dup)
 	var conflict *ErrReleaseAlreadyExists
 	if !errors.As(err, &conflict) {
 		t.Fatalf("same-batch duplicate err = %v, want *ErrReleaseAlreadyExists", err)
@@ -37,6 +42,12 @@ func TestBatchIsolationAcrossBatchesSharingVersion(t *testing.T) {
 	gotA, err := db.ListReleaseRecords(ReleaseRecordFilter{BatchID: "batch-1"})
 	if err != nil || len(gotA) != 1 || gotA[0].BatchID != "batch-1" || len(gotA[0].Changes) != 1 {
 		t.Fatalf("batch-1 filter = %+v, %v", gotA, err)
+	}
+	// Batches stay isolated only across different environments.
+	otherEnv := sampleRecord("test", "1.0.0", "allowed", "rb:0.9.0", entries("b")...)
+	otherEnv.BatchID = "batch-2"
+	if err := db.InsertReleaseRecord(otherEnv); err != nil {
+		t.Fatalf("same version in a different environment and batch must be allowed: %v", err)
 	}
 	exists, err := db.ReleaseBatchExists("batch-2")
 	if err != nil || !exists {

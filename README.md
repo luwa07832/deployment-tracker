@@ -172,6 +172,8 @@ go run .
   - `id`：稳定记录标识，形如 `rel_` 加 32 个十六进制字符（不暴露数据库主键）；
   - `recorded_at`：服务端生成的记录时间，UTC，`YYYY-MM-DDTHH:MM:SSZ`；
   - 完整的 `environment`、`version`、`changes`、`gate_status`、`rollback_point`；写入时提供了 `batch_id` 时还包含该字段。
+- 登记是原子的：重复检查、发布主记录与全部变更条目在同一个立即写事务内完成。任一步骤失败时整体回滚，不留主记录或半条变更，随后用相同字段与 `changes` 重试可正常创建，不会因残留触发重复冲突。
+- 同一 `environment` + `version` 全局唯一，与 `batch_id` 无关：并发提交相同环境版本（即使批次或请求内容不同）也只有一个请求返回 201，其余返回 409，任何查询、历史或比对入口都读不到第二条并行有效版本。
 - 写入成功后立即可由下面的查询入口与差异比对读取。
 
 错误码（错误体仍只有 `error` 一个顶层键）：
@@ -179,9 +181,10 @@ go run .
 | 场景 | 状态码 | code |
 |---|---|---|
 | 目标环境未登记 | 404 | `ENVIRONMENT_NOT_FOUND` |
-| 同一环境同一版本重复提交 | 409 | `RELEASE_ALREADY_EXISTS` |
+| 同一环境同一版本重复或并发提交（含不同 `batch_id`、不同内容） | 409 | `RELEASE_ALREADY_EXISTS` |
 | 必填字段缺失、类型不符、`sequence` 非法或重复、门禁枚举非法、回滚点为空白、`batch_id` 为空白或超长 | 422 | `RELEASE_VALIDATION_FAILED` |
 | 请求体不是合法 JSON | 400 | `invalid_request` |
+| 保存主记录或任一变更条目时存储失败（已整体回滚，可原样重试） | 503 | `storage_unavailable` |
 
 ### `GET /api/v1/release-records`
 
@@ -340,7 +343,7 @@ go run .
 ### 发布记录上的批次标识
 
 - `POST /api/v1/release-records` 的请求体新增**可选**字段 `batch_id`：非空白字符串，最长 200 个字符。省略或为空字符串（不提供该字段）时记录为无批次记录，响应形状与以前完全一致（不出现 `batch_id` 键）。
-- 无批次记录仍要求同一 `environment` + `version` 唯一；带批次记录按 `(environment, version, batch_id)` 唯一：**不同批次复用同一环境同一版本互不冲突**，但同一批次在同一环境重复提交同一版本仍返回 409 `RELEASE_ALREADY_EXISTS`；带批次与无批次记录占用同一个 `(environment, version)` 时也返回 409，二者不能并存。
+- 同一 `environment` + `version` 对所有记录全局唯一，与是否带批次无关：无论 `batch_id` 是否相同、请求内容是否一致，重复或并发提交同一环境同一版本都只有一个 201，其余返回 409 `RELEASE_ALREADY_EXISTS`；同一版本仍可登记到不同环境（可带任意批次）。
 - 成功响应中的记录在带批次时额外包含 `"batch_id": "..."`；`GET /api/v1/release-records` 新增可选过滤参数 `batch_id`（精确匹配，与其它过滤条件 AND 组合）。
 - 批次隔离是硬边界：链路、差异与追溯只读取同一 `batch_id` 的发布事实，多个批次复用同一版本也不会被合并成别的链路。
 

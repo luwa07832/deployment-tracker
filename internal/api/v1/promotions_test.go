@@ -183,33 +183,60 @@ func TestPromotionChainListsEveryReleaseAtOneNode(t *testing.T) {
 	}
 }
 
-func TestBatchesSharingVersionsStayIsolated(t *testing.T) {
+func TestBatchesSharingEnvironmentVersionAlwaysConflict(t *testing.T) {
 	router := newTestRouter(t)
-	for _, env := range []string{"dev", "prod"} {
+	for _, env := range []string{"dev", "test", "prod"} {
 		registerEnvironmentOK(t, router, env)
 	}
-	for _, batch := range []string{"b-a", "b-b"} {
-		createRecordOK(t, router, batchRecordBody(batch, "dev", "9.9.9", "allowed", "rb:0.9.0", "shared"))
-	}
+	created := createRecordOK(t, router, batchRecordBody("b-a", "dev", "9.9.9", "allowed", "rb:0.9.0", "shared"))
+
+	// Same env+version in a different batch, with different gate and changes,
+	// still conflicts: the (environment, version) pair is globally unique.
+	wantError(t, doRequest(t, router, http.MethodPost, "/api/v1/release-records",
+		batchRecordBody("b-b", "dev", "9.9.9", "blocked", "rb:0.8.0", "different")),
+		http.StatusConflict, store.CodeReleaseAlreadyExistsV1)
+	// Same batch duplicate submission conflicts as before.
+	wantError(t, doRequest(t, router, http.MethodPost, "/api/v1/release-records",
+		batchRecordBody("b-a", "dev", "9.9.9", "allowed", "rb:0.9.0", "shared")),
+		http.StatusConflict, store.CodeReleaseAlreadyExistsV1)
+	// Same env+version without a batch conflicts with the batched record.
+	unbatched := `{"environment":"dev","version":"9.9.9","changes":[
+		{"category":"feature","title":"shared","description":"desc shared"}],
+		"gate_status":"allowed","rollback_point":"rb:0.9.0"}`
+	wantError(t, doRequest(t, router, http.MethodPost, "/api/v1/release-records", unbatched),
+		http.StatusConflict, store.CodeReleaseAlreadyExistsV1)
+
+	// Different environments keep using the same version across both batches.
 	createRecordOK(t, router, batchRecordBody("b-a", "prod", "9.9.9", "allowed", "rb:0.9.0", "shared"))
+	createRecordOK(t, router, batchRecordBody("b-b", "test", "9.9.9", "allowed", "rb:0.9.0", "shared"))
 
-	// b-a has facts in both nodes and stays a consistent chain.
-	bodyA := decodeBody(t, doRequest(t, router, http.MethodGet,
-		"/api/v1/release-batches/b-a/promotion-chain?environments=dev,prod", ""))
-	if bodyA["consistent"] != true {
-		t.Fatalf("b-a consistent = %v, want true", bodyA["consistent"])
-	}
-	// b-b has no prod fact: its chain must not merge with b-a's prod fact.
-	wantError(t, doRequest(t, router, http.MethodGet,
-		"/api/v1/release-batches/b-b/promotion-chain?environments=dev,prod", ""),
-		http.StatusConflict, store.CodePromotionOrderConflictV1)
-
-	// batch_id filter on the list endpoint stays isolated too.
+	// The rejected b-b dev submission left no row, while the winner stays
+	// queryable through the batch filter and the get endpoint.
 	listBody := decodeBody(t, doRequest(t, router, http.MethodGet,
-		"/api/v1/release-records?batch_id=b-b", ""))
+		"/api/v1/release-records?batch_id=b-a", ""))
 	records := listBody["release_records"].([]any)
-	if len(records) != 1 || records[0].(map[string]any)["batch_id"] != "b-b" {
-		t.Fatalf("batch filter = %v", records)
+	if len(records) != 2 {
+		t.Fatalf("b-a records = %v, want dev and prod", records)
+	}
+	devRecords := decodeBody(t, doRequest(t, router, http.MethodGet,
+		"/api/v1/release-records?batch_id=b-b&environment=dev", ""))["release_records"].([]any)
+	if len(devRecords) != 0 {
+		t.Fatalf("conflicted b-b dev row survived: %v", devRecords)
+	}
+	got := decodeBody(t, doRequest(t, router, http.MethodGet,
+		"/api/v1/release-records/"+created["id"].(string), ""))["release_record"].(map[string]any)
+	if got["batch_id"] != "b-a" || got["gate_status"] != "allowed" {
+		t.Fatalf("winning record = %v", got)
+	}
+	if len(got["changes"].([]any)) != 1 {
+		t.Fatalf("winning record changes = %v", got["changes"])
+	}
+
+	// No second parallel effective version is visible to comparison reads.
+	allDev := decodeBody(t, doRequest(t, router, http.MethodGet,
+		"/api/v1/release-records?environment=dev&version=9.9.9", ""))["release_records"].([]any)
+	if len(allDev) != 1 || allDev[0].(map[string]any)["id"] != created["id"] {
+		t.Fatalf("parallel effective versions visible: %v", allDev)
 	}
 }
 
