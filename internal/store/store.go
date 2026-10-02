@@ -144,6 +144,21 @@ CREATE TABLE IF NOT EXISTS release_change_entries (
   title       TEXT    NOT NULL,
   description TEXT    NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS release_gate_evaluations (
+  id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+  record_id              INTEGER NOT NULL UNIQUE REFERENCES release_records(id),
+  gate_status            TEXT    NOT NULL,
+  effective_gate_status  TEXT    NOT NULL
+);
+CREATE TABLE IF NOT EXISTS release_gate_checks (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  evaluation_id  INTEGER NOT NULL REFERENCES release_gate_evaluations(id),
+  check_name     TEXT    NOT NULL,
+  check_status   TEXT    NOT NULL,
+  evidence       TEXT    NOT NULL,
+  waiver_reason  TEXT    NOT NULL DEFAULT '',
+  UNIQUE (evaluation_id, check_name)
+);
 CREATE TABLE IF NOT EXISTS promotion_routes (
   id   INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT    NOT NULL UNIQUE
