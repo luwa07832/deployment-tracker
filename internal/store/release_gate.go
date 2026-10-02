@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -90,4 +91,16 @@ func SetReleaseInsertFaultHookForTest(hook func(record *ReleaseRecord, attempt i
 	previous := releaseInsertFaultHook
 	releaseInsertFaultHook = hook
 	return func() { releaseInsertFaultHook = previous }
+}
+
+// SetRecordedAtForTest pins the recorded_at timestamp of a stored release
+// record by its internal id. It exists for tests that need deterministic
+// ordering across same-second writes. Test-only.
+func (s *Store) SetRecordedAtForTest(id int64, recordedAt string) error {
+	if _, err := s.db.Exec(
+		`UPDATE release_records SET recorded_at = ? WHERE id = ?`, recordedAt, id,
+	); err != nil {
+		return fmt.Errorf("store: pin recorded_at: %w", err)
+	}
+	return nil
 }

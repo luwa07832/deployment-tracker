@@ -22,6 +22,7 @@ func Register(engine *gin.Engine, deps Dependencies) {
 	group.POST("/release-records", createReleaseRecord(deps))
 	group.GET("/release-records", listReleaseRecords(deps))
 	group.GET("/release-records/:id", getReleaseRecord(deps))
+	group.GET("/change-entries", listChangeEntries(deps))
 	group.GET("/compare", compareEnvironments(deps))
 	group.GET("/release-comparison", compareReleases(deps))
 	group.GET("/environments/:environment/release-history", listReleaseHistory(deps))

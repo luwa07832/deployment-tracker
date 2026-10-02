@@ -206,6 +206,44 @@ go run .
 
 按稳定标识取得单条完整记录（含全部变更条目与回滚点）；不存在返回 404 `RELEASE_RECORD_NOT_FOUND`。
 
+### `GET /api/v1/change-entries`
+
+跨发布检索结构化变更条目。结果只包含 `POST /api/v1/release-records` 写入的结构化 `changes`；旧版 `POST /releases` 的字符串变更不进入结果。查询参数全部可选，前六项提供时按 AND 精确匹配、省略时不筛：
+
+| 参数 | 含义 |
+|---|---|
+| `environment` | 目标环境；未登记时 404 `ENVIRONMENT_NOT_FOUND` |
+| `version` | 所属发布的精确版本 |
+| `batch_id` | 所属发布的批次标识（仅写入时携带该字段的记录；省略时不按批次筛） |
+| `category` | 变更条目分类精确匹配 |
+| `title` | 变更条目标题精确匹配 |
+| `gate_status` | 所属发布门禁状态；仅接受 `allowed`、`blocked`、`pending` |
+| `from` / `to` | 所属发布 `recorded_at` 的 UTC 秒级闭区间，格式严格为 `YYYY-MM-DDTHH:MM:SSZ`，均可省略 |
+| `limit` | 每页条数，默认 20，仅接受 1 到 100 的整数 |
+| `cursor` | 上一页返回的不透明分页游标 |
+
+每个条目包含 `sequence`、`category`、`title`、`description`，以及所属发布的 `id`、`environment`、`version`、`batch_id`（发布未携带该字段时省略该键）、`gate_status`、`rollback_point`、`recorded_at`。排序固定为：所属发布按 `recorded_at` 降序、同一秒按写入顺序降序；同一发布内按 `sequence`、`title` 升序。
+
+响应外层只有 `changes` 与 `next_cursor` 两个键：
+
+```json
+{"changes":[{"sequence":1,"category":"feature","title":"add login","description":"...","id":"rel_…","environment":"prod","version":"1.2.0","gate_status":"allowed","rollback_point":"snapshot:1.1.0","recorded_at":"2026-10-01T08:00:00Z"}],"next_cursor":""}
+```
+
+- 末页 `next_cursor` 为空字符串 `""`；无命中时 `changes` 为确定的空数组 `[]`。
+- `cursor` 与首次请求的全部筛选条件绑定：截断、篡改（含签名不符）或与当前筛选条件不一致均返回 400。游标是键集位置，首次请求已存在的条目在翻页过程中不会因为并发新增而重复或遗漏，新写入只影响之后发起的首次请求；并发新增不改变首批条目的相对顺序。
+
+错误码（仍为单错误 JSON 形状）：
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| 任一参数为空白、`limit` 越界或非整数、时间格式非法、`from` 晚于 `to`、`gate_status` 非枚举值、`cursor` 截断/篡改/与筛选条件不一致 | 400 | `INVALID_CHANGE_QUERY` |
+| `environment` 已登记但无命中 | 200 | —（`changes` 为 `[]`） |
+| `environment` 未登记 | 404 | `ENVIRONMENT_NOT_FOUND` |
+| 存储不可用 | 503 | `storage_unavailable` |
+
+所有条件校验先于环境登记检查，因此未登记环境同时携带非法参数时先返回 400。该入口为只读，不改变 release-records 的写入、重复登记与冲突语义，也不影响其他任何入口。
+
 ### `GET /api/v1/compare?left=<env>&right=<env>[&version=<v> | &as_of=<time>]`
 
 比较两个已登记环境，读取语义与上面的查询入口完全一致。范围口径二选一：

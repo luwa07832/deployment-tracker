@@ -41,6 +41,35 @@ type ReleaseRecordFilter struct {
 	To          string
 }
 
+// ChangeEntryFilter narrows ListChangeEntries. Empty fields are ignored;
+// From/To are inclusive second-precision UTC bounds on recorded_at.
+type ChangeEntryFilter struct {
+	Environment string
+	Version     string
+	BatchID     string
+	Category    string
+	Title       string
+	GateStatus  string
+	From        string
+	To          string
+}
+
+// ChangeEntryItem is one structured change entry joined with the public
+// fields of the release record it belongs to. Only release-records changes
+// are represented here; baseline POST /releases changes never appear.
+type ChangeEntryItem struct {
+	RecordID      int64
+	RecordedAt    string
+	EntryID       int64
+	Entry         ChangeEntry
+	PublicID      string
+	Environment   string
+	Version       string
+	BatchID       string
+	GateStatus    string
+	RollbackPoint string
+}
+
 const releaseRecordColumns = `public_id, environment, version, batch_id, gate_status, rollback_point, recorded_at`
 
 // ErrReleaseAlreadyExists marks a duplicate (environment, version) submission.
@@ -350,4 +379,99 @@ func (s *Store) ReleaseBatchExists(batchID string) (bool, error) {
 		return false, fmt.Errorf("store: check release batch: %w", err)
 	}
 	return count > 0, nil
+}
+
+// ListChangeEntries returns one page of structured change entries matching
+// the filter. Entries are ordered by the owning release newest first
+// (recorded_at descending, internal record id descending to break
+// same-second ties in write order) and inside a release by sequence then
+// title ascending. The keyset anchor marks the last entry already returned;
+// zero values request the first page. Up to limit+1 rows are fetched so the
+// caller can detect a following page.
+func (s *Store) ListChangeEntries(
+	filter ChangeEntryFilter,
+	anchor ChangeEntryItem,
+	limit int,
+) ([]ChangeEntryItem, error) {
+	where := []string{}
+	args := []any{}
+	if filter.Environment != "" {
+		where = append(where, `r.environment = ?`)
+		args = append(args, filter.Environment)
+	}
+	if filter.Version != "" {
+		where = append(where, `r.version = ?`)
+		args = append(args, filter.Version)
+	}
+	if filter.BatchID != "" {
+		where = append(where, `r.batch_id = ?`)
+		args = append(args, filter.BatchID)
+	}
+	if filter.Category != "" {
+		where = append(where, `e.category = ?`)
+		args = append(args, filter.Category)
+	}
+	if filter.Title != "" {
+		where = append(where, `e.title = ?`)
+		args = append(args, filter.Title)
+	}
+	if filter.GateStatus != "" {
+		where = append(where, `r.gate_status = ?`)
+		args = append(args, filter.GateStatus)
+	}
+	if filter.From != "" {
+		where = append(where, `r.recorded_at >= ?`)
+		args = append(args, filter.From)
+	}
+	if filter.To != "" {
+		where = append(where, `r.recorded_at <= ?`)
+		args = append(args, filter.To)
+	}
+	if anchor.RecordID > 0 {
+		where = append(where,
+			`(r.recorded_at < ?
+			  OR (r.recorded_at = ? AND r.id < ?)
+			  OR (r.recorded_at = ? AND r.id = ? AND
+			      (e.sequence_no > ? OR (e.sequence_no = ? AND e.title > ?))))`)
+		args = append(args,
+			anchor.RecordedAt,
+			anchor.RecordedAt, anchor.RecordID,
+			anchor.RecordedAt, anchor.RecordID,
+			anchor.Entry.Sequence, anchor.Entry.Sequence, anchor.Entry.Title,
+		)
+	}
+	query := `SELECT r.id, r.public_id, r.environment, r.version, r.batch_id,
+	                 r.gate_status, r.rollback_point, r.recorded_at,
+	                 e.id, e.sequence_no, e.category, e.title, e.description
+	          FROM release_change_entries e
+	          JOIN release_records r ON r.id = e.record_id`
+	if len(where) > 0 {
+		query += ` WHERE ` + strings.Join(where, ` AND `)
+	}
+	query += ` ORDER BY r.recorded_at DESC, r.id DESC, e.sequence_no ASC, e.title ASC, e.id ASC
+	           LIMIT ?`
+	args = append(args, limit+1)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: query change entries: %w", err)
+	}
+	defer rows.Close()
+	items := []ChangeEntryItem{}
+	for rows.Next() {
+		var item ChangeEntryItem
+		if err := rows.Scan(
+			&item.RecordID, &item.PublicID, &item.Environment, &item.Version, &item.BatchID,
+			&item.GateStatus, &item.RollbackPoint, &item.RecordedAt,
+			&item.EntryID, &item.Entry.Sequence, &item.Entry.Category,
+			&item.Entry.Title, &item.Entry.Description,
+		); err != nil {
+			return nil, fmt.Errorf("store: scan change entry: %w", err)
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("store: query change entries: %w", err)
+	}
+	return items, nil
 }
