@@ -215,24 +215,21 @@ func diffVersion(version string, left, right *store.ReleaseRecord) versionDiffVi
 			Right: right.RollbackPoint,
 		})
 	}
-	leftEntries := indexEntries(left.Changes)
-	rightEntries := indexEntries(right.Changes)
-	for title, rightEntry := range rightEntries {
-		leftEntry, present := leftEntries[title]
-		if !present {
-			view.AddedChanges = append(view.AddedChanges, toChangeEntryView(rightEntry))
-			continue
-		}
-		if !sameEntry(leftEntry, rightEntry) {
+	// Entries are grouped by title and, inside a title group, paired by
+	// ascending sequence. Repeated titles (possible in historical records)
+	// therefore each participate: surplus entries are added or removed rather
+	// than collapsing onto the last entry of the title.
+	for _, pair := range pairChangesByTitle(left.Changes, right.Changes) {
+		switch {
+		case pair.Left == nil:
+			view.AddedChanges = append(view.AddedChanges, toChangeEntryView(*pair.Right))
+		case pair.Right == nil:
+			view.RemovedChanges = append(view.RemovedChanges, toChangeEntryView(*pair.Left))
+		case !sameEntry(*pair.Left, *pair.Right):
 			view.ChangedChanges = append(view.ChangedChanges, changedEntryView{
-				Left:  toChangeEntryView(leftEntry),
-				Right: toChangeEntryView(rightEntry),
+				Left:  toChangeEntryView(*pair.Left),
+				Right: toChangeEntryView(*pair.Right),
 			})
-		}
-	}
-	for title, leftEntry := range leftEntries {
-		if _, present := rightEntries[title]; !present {
-			view.RemovedChanges = append(view.RemovedChanges, toChangeEntryView(leftEntry))
 		}
 	}
 	sortEntries(view.AddedChanges)
@@ -241,14 +238,6 @@ func diffVersion(version string, left, right *store.ReleaseRecord) versionDiffVi
 		return entryOrder(view.ChangedChanges[i].Left) < entryOrder(view.ChangedChanges[j].Left)
 	})
 	return view
-}
-
-func indexEntries(entries []store.ChangeEntry) map[string]store.ChangeEntry {
-	indexed := make(map[string]store.ChangeEntry, len(entries))
-	for _, entry := range entries {
-		indexed[entry.Title] = entry
-	}
-	return indexed
 }
 
 func toChangeEntryView(entry store.ChangeEntry) changeEntryView {
@@ -266,7 +255,7 @@ func sortEntries(entries []changeEntryView) {
 }
 
 func entryOrder(entry changeEntryView) string {
-	return padSequence(entry.Sequence) + "\x00" + entry.Title
+	return changeViewOrderKey(entry)
 }
 
 // padSequence makes sequence ordering lexical regardless of digit count.

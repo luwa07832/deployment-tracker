@@ -175,6 +175,7 @@ func validateRecordInput(input *createRecordInput) (*store.ReleaseRecord, string
 	entries := make([]store.ChangeEntry, 0, len(rawEntries))
 	explicit := false
 	seenSequences := map[int]bool{}
+	seenTitles := map[string]bool{}
 	for i, raw := range rawEntries {
 		if raw.Category == nil || strings.TrimSpace(*raw.Category) == "" {
 			return nil, "changes[" + strconv.Itoa(i) + "].category is required"
@@ -182,6 +183,11 @@ func validateRecordInput(input *createRecordInput) (*store.ReleaseRecord, string
 		if raw.Title == nil || strings.TrimSpace(*raw.Title) == "" {
 			return nil, "changes[" + strconv.Itoa(i) + "].title is required"
 		}
+		title := strings.TrimSpace(*raw.Title)
+		if seenTitles[title] {
+			return nil, "changes titles must be unique: " + title
+		}
+		seenTitles[title] = true
 		if raw.Description == nil || strings.TrimSpace(*raw.Description) == "" {
 			return nil, "changes[" + strconv.Itoa(i) + "].description is required"
 		}
@@ -200,7 +206,7 @@ func validateRecordInput(input *createRecordInput) (*store.ReleaseRecord, string
 		entries = append(entries, store.ChangeEntry{
 			Sequence:    sequence,
 			Category:    strings.TrimSpace(*raw.Category),
-			Title:       strings.TrimSpace(*raw.Title),
+			Title:       title,
 			Description: strings.TrimSpace(*raw.Description),
 		})
 	}

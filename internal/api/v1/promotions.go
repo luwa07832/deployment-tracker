@@ -390,38 +390,34 @@ func diffNodes(fromName, toName string, from, to *store.ReleaseRecord) segmentDi
 			Changed: from.RollbackPoint != to.RollbackPoint,
 		},
 	}
-	fromEntries := indexEntries(from.Changes)
-	toEntries := indexEntries(to.Changes)
-	for title, toEntry := range toEntries {
-		fromEntry, present := fromEntries[title]
-		if !present {
-			segment.AddedChanges = append(segment.AddedChanges, toChangeEntryView(toEntry))
-			continue
-		}
-		if !sameEntry(fromEntry, toEntry) {
+	// Entries are grouped by title and paired inside each group by ascending
+	// sequence, so every repeated-title entry of a historical record is
+	// compared instead of only the last one surviving the title index.
+	for _, pair := range pairChangesByTitle(from.Changes, to.Changes) {
+		switch {
+		case pair.Left == nil:
+			segment.AddedChanges = append(segment.AddedChanges, toChangeEntryView(*pair.Right))
+		case pair.Right == nil:
+			segment.MissingChanges = append(segment.MissingChanges, toChangeEntryView(*pair.Left))
+		case !sameEntry(*pair.Left, *pair.Right):
 			segment.InconsistentChanges = append(segment.InconsistentChanges, inconsistentChangeView{
-				Left:  toChangeEntryView(fromEntry),
-				Right: toChangeEntryView(toEntry),
+				Left:  toChangeEntryView(*pair.Left),
+				Right: toChangeEntryView(*pair.Right),
 			})
-		}
-	}
-	for title, fromEntry := range fromEntries {
-		if _, present := toEntries[title]; !present {
-			segment.MissingChanges = append(segment.MissingChanges, toChangeEntryView(fromEntry))
 		}
 	}
 	sortEntriesByTitle(segment.AddedChanges)
 	sortEntriesByTitle(segment.MissingChanges)
 	sort.Slice(segment.InconsistentChanges, func(i, j int) bool {
-		return segment.InconsistentChanges[i].Left.Title < segment.InconsistentChanges[j].Left.Title
+		return entryOrder(segment.InconsistentChanges[i].Left) < entryOrder(segment.InconsistentChanges[j].Left)
 	})
 	return segment
 }
 
-// sortEntriesByTitle orders change views by their stable title identifier.
+// sortEntriesByTitle orders change views by title then sequence.
 func sortEntriesByTitle(entries []changeEntryView) {
 	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Title < entries[j].Title
+		return entryOrder(entries[i]) < entryOrder(entries[j])
 	})
 }
 
@@ -503,8 +499,7 @@ func tracePromotionChange(deps Dependencies) gin.HandlerFunc {
 		firstIndex := -1
 		var firstEntry store.ChangeEntry
 		for i, key := range req.Environments {
-			entry, present := indexEntries(effective[key].Changes)[title]
-			if present {
+			if entry, ok := firstChangeByTitle(effective[key].Changes, title); ok {
 				firstIndex = i
 				firstEntry = entry
 				break
@@ -517,7 +512,7 @@ func tracePromotionChange(deps Dependencies) gin.HandlerFunc {
 		}
 		passed := []string{}
 		for _, key := range req.Environments[firstIndex:] {
-			if _, present := indexEntries(effective[key].Changes)[title]; present {
+			if containsChangeTitle(effective[key].Changes, title) {
 				passed = append(passed, key)
 			} else {
 				break
@@ -525,7 +520,7 @@ func tracePromotionChange(deps Dependencies) gin.HandlerFunc {
 		}
 		firstMissing := ""
 		for _, key := range req.Environments[firstIndex+1:] {
-			if _, present := indexEntries(effective[key].Changes)[title]; !present {
+			if !containsChangeTitle(effective[key].Changes, title) {
 				firstMissing = key
 				break
 			}
@@ -547,7 +542,7 @@ func tracePromotionChange(deps Dependencies) gin.HandlerFunc {
 // fact at one node that carries the titled change entry.
 func firstReleaseTimeForChange(facts []store.ReleaseRecord, title string) string {
 	for i := range facts {
-		if _, present := indexEntries(facts[i].Changes)[title]; present {
+		if containsChangeTitle(facts[i].Changes, title) {
 			return facts[i].RecordedAt
 		}
 	}

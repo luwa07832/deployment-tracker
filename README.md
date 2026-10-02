@@ -165,7 +165,7 @@ go run .
 ```
 
 - `environment`、`version`、`changes`、`gate_status`、`rollback_point` 均为必填；`changes` 为数组（允许空数组）。`batch_id` 为可选：非空白字符串，最长 200 个字符，用于发布晋级链路（见下文）；空白但非省略时按校验失败处理。
-- 每个变更条目的 `category`、`title`、`description` 为必填非空字符串；`sequence` 为可选正整数。要么所有条目都带 `sequence`（且互不相同），要么全部省略——全省略时服务端按数组顺序从 1 编号。
+- 每个变更条目的 `category`、`title`、`description` 为必填非空字符串；`title` 去除首尾空白后在同一份 `changes` 中只能出现一次，重复时整条请求返回 422 `RELEASE_VALIDATION_FAILED` 且不写入任何数据；`sequence` 为可选正整数。要么所有条目都带 `sequence`（且互不相同），要么全部省略——全省略时服务端按数组顺序从 1 编号。
 - `gate_status` 只接受 `allowed`、`blocked`、`pending`。
 - `rollback_point` 是公开入口中的稳定标识，服务端只原样保存，不推断、不读取或生成任何文件内容。
 - 成功返回 201 与 `{"release_record": {...}}`，记录包含：
@@ -362,7 +362,7 @@ go run .
 }
 ```
 
-- 方向固定为 left → right：`added_changes` 是右侧有、左侧无；`removed_changes` 相反；变更条目按 `title` 识别为同一条，序号、分类或描述不同进入 `changed_changes`。
+- 方向固定为 left → right：`added_changes` 是右侧有、左侧无；`removed_changes` 相反；变更条目先按 `title` 分组、同组按 `sequence` 从小到大逐个配对识别为同一条，序号、分类或描述不同进入 `changed_changes`，历史记录中的同名条目逐条参与。各差异列表按 `title`、再按 `sequence` 排列。
 - `field_diffs` 列出共有版本上其它标量字段的差异（目前包含 `rollback_point`）。
 - 所有版本列表按点分段版本序排列，空结果是确定的空数组；`baseline_version` 仅在版本口径下出现，`as_of` 仅在截止时间口径下出现（无范围口径时二者均省略）；`compared_at` 为服务端比较时刻（UTC 秒精度），用于解释结果。除该时间戳外，同一输入的结果逐字节稳定。
 
@@ -425,7 +425,7 @@ go run .
 
 约定：
 
-- 方向固定为 left → right。`changes` 逐条给出差异，按稳定标识 `change_id`（即变更条目的 `title`）字典序排列，只包含有差异的条目：
+- 方向固定为 left → right。变更条目先按 `title` 分组，同组再按 `sequence` 从小到大逐个配对；多出的条目按方向计为 `added`/`missing`。`changes` 逐条给出差异，先按 `change_id`（即变更条目的 `title`）、同 `change_id` 再按 `sequence` 排列，只包含有差异的条目（历史记录中的同名条目逐条参与，不去重）：
   - `added`：右侧有、左侧无（`present` 为 `{left:false,right:true}`）；
   - `missing`：左侧有、右侧无（`present` 为 `{left:true,right:false}`）；
   - `changed`：两侧都有但序号、分类或描述不同（完整两侧条目同时给出）。
@@ -506,7 +506,7 @@ go run .
 
 约定：
 
-- `rollback_impact` 方向固定为 current → target，比较口径与 release-comparison 一致：`version`、`gate_status`、`rollback_point`（标识原值及其解析到的目标发布对象两层）以及以 `title` 标识的变更条目（`added`：目标有、current 无；`missing`：current 有、目标无；`changed`：两侧都有但序号、分类或描述不同）。
+- `rollback_impact` 方向固定为 current → target，比较口径与 release-comparison 一致：`version`、`gate_status`、`rollback_point`（标识原值及其解析到的目标发布对象两层）以及按 `title` 分组、同组按 `sequence` 逐个配对的变更条目（`added`：目标有、current 无；`missing`：current 有、目标无；`changed`：两侧都有但序号、分类或描述不同；同名条目逐条配对，不去重）。
 - 目标就是 current 自身时差异为确定空结果：`changes` 为 `[]`、`change_summary` 全 0、各 `changed` 为 false、`consistent` 为 true。
 - 目标缺失（`missing`）时差异只承载 current 侧事实：标量 `right` 省略、变更全部计为 `missing`、`consistent` 为 false。
 - 响应不含除 `as_of` 外的服务端生成时刻；显式给出 `as_of` 且数据不变时，连续查询的字段、顺序与结论逐字节稳定。本端点只读，不写入任何发布事实。
@@ -620,8 +620,8 @@ go run .
     {
       "from_environment": "dev",
       "to_environment": "test",
-      "added_changes": [ { "…变更条目…": "下游有、上游无（按 title 排序）" } ],
-      "missing_changes": [ { "…变更条目…": "上游有、下游无（按 title 排序）" } ],
+      "added_changes": [ { "…变更条目…": "下游有、上游无（按 title、sequence 排序）" } ],
+      "missing_changes": [ { "…变更条目…": "上游有、下游无（按 title、sequence 排序）" } ],
       "inconsistent_changes": [
         {"left": {"…变更条目…": "上游"}, "right": {"…变更条目…": "下游（title 相同但 sequence/category/description 不同）"}}
       ],
