@@ -455,6 +455,73 @@ go run .
 - 还有后续记录时 `next_cursor` 为非空字符串；最后一页为空字符串 `""`。无记录时 `releases` 为确定的空数组 `[]`。
 - 环境未登记返回 404 `ReleaseComparisonEnvironmentNotFound`；分页参数校验先于环境存在性检查。
 
+### `GET /api/v1/environments/{environment}/release-state[?as_of=<time>][&target_version=<v>]`
+
+单环境发布状态与回滚影响查询，只读。`environment` 按已保存的原值精确匹配（不做空白裁剪或大小写改写）。`as_of` 省略时取查询时刻；给出时接受 RFC3339 时刻或 `YYYY-MM-DD` 日期，日期按 UTC 当日 `23:59:59` 规范化为 `YYYY-MM-DDTHH:MM:SSZ` 并原样回显。无法解析返回 422 `RELEASE_STATE_TIME_INVALID`。
+
+截止时刻（含）内的发布记录中，`recorded_at` 最新者为 `current_release`；同一时刻写入的多条以后写入者（内部写入顺序靠后）为当前。紧邻的前一条为 `previous_release`，没有前一条时为 `null`。
+
+回滚目标（`rollback_target`）的解析分两种口径：
+
+- 不给 `target_version`：沿用 release-comparison 的原值语义，取 current 的 `rollback_point` 原值，在**截止范围内**解析它指向的发布记录。解析成功时 `rollback_target_status` 为 `resolved` 并给出完整记录；目标在范围内不存在时为 `missing` 且 `rollback_target` 为 `null`（这是合法的 200 结果）。
+- 给出 `target_version`：按原值在该环境精确解析指定版本，不受截止范围限制。成功时状态为 `requested`；目标版本不存在返回 404 `ROLLBACK_TARGET_NOT_FOUND`。参数为纯空白返回 400 `INVALID_RELEASE_STATE_TARGET`。
+
+成功返回 200：
+
+```json
+{
+  "environment": "prod",
+  "as_of": "2026-10-01T23:59:59Z",
+  "current_release": {"…": "截止时刻的当前发布完整记录"},
+  "previous_release": {"…": "紧邻前一条，或 null"},
+  "rollback_target_status": "resolved",
+  "rollback_target": {"…": "回滚将落到的发布完整记录，missing 时为 null"},
+  "rollback_impact": {
+    "from_version": "1.2.0",
+    "to_version": "1.1.0",
+    "version": {"left": "1.2.0", "right": "1.1.0", "changed": true},
+    "gate_status": {"left": "blocked", "right": "allowed", "changed": true},
+    "rollback_point": {
+      "left": "1.1.0",
+      "right": "1.0.0",
+      "changed": true,
+      "left_target": {"…": "current 回滚点在截止范围内解析到的记录，无法解析为 null"},
+      "right_target": {"…": "目标回滚点解析到的记录，无法解析或目标缺失为 null"},
+      "target_changed": true
+    },
+    "changes": [
+      {
+        "change_id": "beta",
+        "summary": {"left": "..."},
+        "present": {"left": true, "right": false},
+        "comparison": "missing",
+        "left": {"…": "current 侧条目"}
+      }
+    ],
+    "change_summary": {"added": 0, "missing": 1, "changed": 0},
+    "consistent": false
+  }
+}
+```
+
+约定：
+
+- `rollback_impact` 方向固定为 current → target，比较口径与 release-comparison 一致：`version`、`gate_status`、`rollback_point`（标识原值及其解析到的目标发布对象两层）以及以 `title` 标识的变更条目（`added`：目标有、current 无；`missing`：current 有、目标无；`changed`：两侧都有但序号、分类或描述不同）。
+- 目标就是 current 自身时差异为确定空结果：`changes` 为 `[]`、`change_summary` 全 0、各 `changed` 为 false、`consistent` 为 true。
+- 目标缺失（`missing`）时差异只承载 current 侧事实：标量 `right` 省略、变更全部计为 `missing`、`consistent` 为 false。
+- 响应不含除 `as_of` 外的服务端生成时刻；显式给出 `as_of` 且数据不变时，连续查询的字段、顺序与结论逐字节稳定。本端点只读，不写入任何发布事实。
+
+错误码（错误体仍只有 `error` 一个顶层键）：
+
+| 场景 | 状态码 | code |
+|---|---|---|
+| `target_version` 为纯空白 | 400 | `INVALID_RELEASE_STATE_TARGET` |
+| `as_of` 无法解析 | 422 | `RELEASE_STATE_TIME_INVALID` |
+| 环境未登记 | 404 | `ENVIRONMENT_NOT_FOUND` |
+| 截止时刻（含）内没有任何发布记录 | 404 | `RELEASE_STATE_NOT_FOUND` |
+| 显式 `target_version` 在该环境无发布记录 | 404 | `ROLLBACK_TARGET_NOT_FOUND` |
+| 存储失败 | 503 | `storage_unavailable` |
+
 ## 发布批次与晋级链路 API（/api/v1）
 
 发布记录可以携带可选的 `batch_id`，用于把同一发布批次在多个环境中的发布事实关联成一条晋级链路。它只是发布记录上的稳定标识：不改变写入、单记录查询和环境差异比对的既有语义。

@@ -361,6 +361,56 @@ func (s *Store) EffectiveReleaseRecord(environment, version string) (*ReleaseRec
 	return &rows[0], nil
 }
 
+// ListLatestReleaseRecords returns the up to limit newest records of an
+// environment recorded at or before asOf (an inclusive second-precision UTC
+// bound; an empty bound disables the cutoff). Ordering follows
+// current/previous release-state selection: recorded_at descending, then
+// insertion id descending so same-timestamp writes keep write order. Each
+// returned record carries its change entries.
+func (s *Store) ListLatestReleaseRecords(environment, asOf string, limit int) ([]ReleaseRecord, error) {
+	query := `SELECT r.id, r.` + strings.ReplaceAll(releaseRecordColumns, ", ", ", r.") +
+		`, e.sequence_no, e.category, e.title, e.description
+		 FROM (
+		   SELECT id, recorded_at FROM release_records
+		   WHERE environment = ?`
+	args := []any{environment}
+	if asOf != "" {
+		query += ` AND recorded_at <= ?`
+		args = append(args, asOf)
+	}
+	query += `
+		   ORDER BY recorded_at DESC, id DESC LIMIT ?
+		 ) AS page
+		 JOIN release_records r ON r.id = page.id
+		 LEFT JOIN release_change_entries e ON e.record_id = r.id
+		 ORDER BY page.recorded_at DESC, page.id DESC, e.sequence_no ASC, e.id ASC`
+	args = append(args, limit)
+	return s.queryReleaseRecords(query, args...)
+}
+
+// EffectiveReleaseRecordAsOf resolves the newest record for an environment
+// and version exactly as EffectiveReleaseRecord does, but only records
+// recorded at or before asOf (inclusive second-precision UTC bound) qualify.
+// It returns (nil, nil) when no in-range record exists.
+func (s *Store) EffectiveReleaseRecordAsOf(environment, version, asOf string) (*ReleaseRecord, error) {
+	rows, err := s.queryReleaseRecords(
+		`SELECT r.id, r.`+strings.ReplaceAll(releaseRecordColumns, ", ", ", r.")+
+			`, e.sequence_no, e.category, e.title, e.description
+		 FROM release_records r
+		 LEFT JOIN release_change_entries e ON e.record_id = r.id
+		 WHERE r.environment = ? AND r.version = ? AND r.recorded_at <= ?
+		 ORDER BY r.id DESC, e.sequence_no ASC, e.id ASC`,
+		environment, version, asOf,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	return &rows[0], nil
+}
+
 // ListReleaseRecordHistory returns one page of an environment's records in
 // the order history pages follow: recorded_at descending, then insertion id
 // descending. The keyset anchor (afterRecordedAt, afterID) marks the last row
