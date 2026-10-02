@@ -533,6 +533,47 @@ go run .
 - 成功响应中的记录在带批次时额外包含 `"batch_id": "..."`；`GET /api/v1/release-records` 新增可选过滤参数 `batch_id`（精确匹配，与其它过滤条件 AND 组合）。
 - 批次隔离是硬边界：链路、差异与追溯只读取同一 `batch_id` 的发布事实，多个批次复用同一版本也不会被合并成别的链路。
 
+### 批次发现：`GET /api/v1/release-batches`
+
+只读发现非空批次（至少有一条携带非空 `batch_id` 的记录；无批次记录不入选）。全部查询参数均可省略，组合时按 AND 生效：
+
+| 参数 | 语义 |
+|---|---|
+| `environment` | 批次内至少有一条记录属于该环境（环境须已登记，否则 404 `ENVIRONMENT_NOT_FOUND`） |
+| `version` | 批次内至少有一条记录为该版本（精确匹配） |
+| `gate_status` | 批次内至少有一条记录门禁状态为该值，仅接受 `allowed`、`blocked`、`pending` |
+| `from` / `to` | 记录 `recorded_at` 的 UTC 秒级闭区间，严格格式 `YYYY-MM-DDTHH:MM:SSZ`，含边界；`from` 晚于 `to` 非法 |
+| `limit` | 每页批次数量，默认 20，仅接受 1 到 100 的整数 |
+| `cursor` | 上一页返回的不透明游标；与首次查询的筛选快照绑定，`limit` 不绑定 |
+
+批次只要存在**至少一条**满足全部条件的记录即入选；但汇总统计覆盖入选批次的**全部**记录（不局限于命中筛选的记录）。返回外层只有 `batches` 与 `next_cursor`：
+
+```json
+{
+  "batches": [
+    {
+      "batch_id": "b-2026-10-01",
+      "release_count": 3,
+      "environments": ["dev", "prod"],
+      "change_count": 5,
+      "gate_counts": {"allowed": 2, "blocked": 0, "pending": 1},
+      "last_recorded_at": "2026-10-01T09:00:00Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+- `environments` 为升序去重；`change_count` 是该批次全部变更条目的总数（不是发布记录数）。
+- 排序固定：`last_recorded_at` 从新到旧，同一时刻按 `batch_id` 从大到小。
+- 末页 `next_cursor` 为 `null`（不是空字符串）；无入选批次时返回 200、`batches` 为确定空数组、`next_cursor` 为 `null`。
+- 游标为 HMAC 签名的不透明键集标记，绑定原筛选；缺绑定、损坏、签名不符或筛选变化均返回 400 `BATCH_QUERY_INVALID`。
+- 空白但显式提供的参数、非法 `gate_status`、无法解析的时间、`limit` 越界同样返回 400 `BATCH_QUERY_INVALID`；数据库不可用返回 503 `storage_unavailable`。
+
+### 单批次全貌：`GET /api/v1/release-batches/{batch_id}`
+
+按 `batch_id` 精确匹配，返回 200 `{"batch": {...}}`：在目录同一汇总字段之外增加 `releases`，即该批次的全部完整发布记录（字段与 `GET /api/v1/release-records` 单条形状一致，带批次记录含 `batch_id`，`changes` 保持原始顺序）。`releases` 按 `recorded_at` 从旧到新排列；同一秒写入的记录按内部 id 从大到小排列。`batch_id` 不存在（含空白）返回 404 `RELEASE_BATCH_NOT_FOUND`；数据库不可用返回 503 `storage_unavailable`。该入口不接受任何查询参数（未知参数被忽略）。
+
 ### 晋级路线（promotion routes）
 
 晋级路线是一条具名、有序的已登记环境序列，批次可以绑定一条路线，之后链路与追溯查询无需再显式给环境序列。路线不写发布事实、不登记环境、不合并批次。
